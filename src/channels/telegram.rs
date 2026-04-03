@@ -325,6 +325,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    allowed_message_thread_ids: Option<std::collections::HashSet<i64>>,
     bot_username: Mutex<Option<String>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
@@ -373,6 +374,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            allowed_message_thread_ids: Self::parse_allowed_message_thread_ids_from_env(),
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
@@ -385,6 +387,137 @@ impl TelegramChannel {
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
         }
+    }
+
+    fn parse_allowed_message_thread_ids_from_env(
+    ) -> Option<std::collections::HashSet<i64>> {
+        const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_ALLOWED_MESSAGE_THREAD_IDS";
+        let raw = std::env::var(ENV_KEY).ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "*" {
+            return None;
+        }
+
+        let mut out = std::collections::HashSet::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "*" {
+                return None;
+            }
+            if let Ok(id) = part.parse::<i64>() {
+                out.insert(id);
+            } else {
+                tracing::warn!("{ENV_KEY}: ignoring invalid thread id: {part}");
+            }
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn debug_incoming_enabled() -> bool {
+        const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_DEBUG_INCOMING";
+        std::env::var(ENV_KEY)
+            .ok()
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
+    fn log_incoming_decision(
+        &self,
+        message: &serde_json::Value,
+        decision: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        if !Self::debug_incoming_enabled() {
+            return;
+        }
+
+        let chat = message.get("chat");
+        let chat_id = chat
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64);
+        let chat_type = chat
+            .and_then(|c| c.get("type"))
+            .and_then(serde_json::Value::as_str);
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64);
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+
+        let from = message.get("from");
+        let sender_id = from
+            .and_then(|f| f.get("id"))
+            .and_then(serde_json::Value::as_i64);
+        let username = from
+            .and_then(|f| f.get("username"))
+            .and_then(serde_json::Value::as_str);
+
+        let is_group = Self::is_group_message(message);
+        let has_text = message.get("text").and_then(serde_json::Value::as_str).is_some();
+        let has_caption = message
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+
+        if let Some(reason) = reason {
+            tracing::info!(
+                target: "zeroclaw::channels::telegram",
+                event = "incoming_message",
+                decision,
+                reason,
+                chat_id,
+                chat_type,
+                message_id,
+                message_thread_id = thread_id,
+                sender_id,
+                username,
+                is_group,
+                mention_only = self.mention_only,
+                has_text,
+                has_caption,
+                "Telegram incoming message filtered"
+            );
+        } else {
+            tracing::info!(
+                target: "zeroclaw::channels::telegram",
+                event = "incoming_message",
+                decision,
+                chat_id,
+                chat_type,
+                message_id,
+                message_thread_id = thread_id,
+                sender_id,
+                username,
+                is_group,
+                mention_only = self.mention_only,
+                has_text,
+                has_caption,
+                "Telegram incoming message accepted"
+            );
+        }
+    }
+
+    fn is_message_thread_allowed(&self, message: &serde_json::Value) -> bool {
+        let Some(allowed) = self.allowed_message_thread_ids.as_ref() else {
+            return true;
+        };
+
+        // If filtering is enabled, require a thread id and require it to match.
+        // This makes the filter strict for forum-topic workflows.
+        let Some(thread_id) = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return false;
+        };
+
+        allowed.contains(&thread_id)
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -1046,6 +1179,25 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
         let attachment = Self::parse_attachment_metadata(message)?;
+        let is_group = Self::is_group_message(message);
+
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
+
+        if self.mention_only && is_group {
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let bot_username = self.bot_username.lock();
+            let bot_username = bot_username.as_ref()?;
+            if !Self::contains_bot_mention(caption, bot_username) {
+                self.log_incoming_decision(message, "FILTERED", Some("missing_bot_mention_in_caption"));
+                return None;
+            }
+        }
 
         // Check file size limit
         if let Some(size) = attachment.file_size {
@@ -1066,6 +1218,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
@@ -1090,6 +1243,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        self.log_incoming_decision(message, "ACCEPTED", None);
 
         // Ensure workspace directory is configured
         let workspace = self.workspace_dir.as_ref().or_else(|| {
@@ -1182,6 +1337,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let config = self.transcription.as_ref()?;
         let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
+        let is_group = Self::is_group_message(message);
+
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
+
+        // Voice messages have no text to @mention the bot; keep group behavior strict.
+        if self.mention_only && is_group {
+            self.log_incoming_decision(message, "FILTERED", Some("voice_in_group_requires_mention"));
+            return None;
+        }
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
 
@@ -1201,6 +1368,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
@@ -1225,6 +1393,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        self.log_incoming_decision(message, "ACCEPTED", None);
 
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
@@ -1413,7 +1583,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .collect::<Vec<_>>()
             .join("\n");
 
-        Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+        // Keep reply context, but do NOT include usernames/names: downstream routing can
+        // misclassify messages as "addressed to <name>, not the assistant".
+        Some(format!("> Reply context:\n{quoted_lines}"))
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
@@ -1429,17 +1601,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
         let is_group = Self::is_group_message(message);
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
                 if !Self::contains_bot_mention(text, bot_username) {
+                    self.log_incoming_decision(message, "FILTERED", Some("missing_bot_mention"));
                     return None;
                 }
             } else {
+                self.log_incoming_decision(message, "FILTERED", Some("bot_username_unknown"));
                 return None;
             }
         }
@@ -1467,6 +1646,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        self.log_incoming_decision(message, "ACCEPTED", None);
 
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();

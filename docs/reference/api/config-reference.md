@@ -235,6 +235,24 @@ Notes:
 Example:
 
 ```toml
+[security]
+# Privacy-by-default: sensitive paths are stripped from what users see on external
+# channels (Telegram, Slack, …), draft streaming updates, gateway SSE/WS event
+# payloads, and live tool-call notifications. The CLI channel is not redacted.
+# Session history and the next LLM turn still use the full assistant text so the
+# model keeps full context. Default: true.
+redact_channel_events = true
+
+[security.channel_event_redaction]
+# Fine-grained sensitive path/marker configuration (glob matching).
+# Applied to user-visible channel/draft/event surfaces only — not to stored
+# conversation history sent back to the LLM.
+# Any matching path token will be replaced with `[REDACTED_INTERNAL_PATH]`.
+# Default: enabled with curated defaults.
+enabled = true
+sensitive_globs = ["**/skills/**", "**/telegram_files/**", "**/SOUL.md", "**/AGENTS.md", "**/USER.md"]
+sensitive_markers = ["SOUL.md", "AGENTS.md", "USER.md"]
+
 [security.otp]
 enabled = true
 method = "totp"

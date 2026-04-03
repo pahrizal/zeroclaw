@@ -140,6 +140,8 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     tools_used: AtomicBool,
+    redact_enabled: bool,
+    redaction_cfg: crate::config::schema::ChannelEventRedactionConfig,
 }
 
 impl Observer for ChannelNotifyObserver {
@@ -154,15 +156,39 @@ impl Observer for ChannelNotifyObserver {
                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
                             format!(": {}", truncate_with_ellipsis(q, 200))
                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+                            let p = if self.redact_enabled {
+                                crate::security::redact_internal_paths_in_text_with_config(
+                                    p,
+                                    &self.redaction_cfg,
+                                )
+                            } else {
+                                p.to_string()
+                            };
                             format!(": {p}")
                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
                             format!(": {u}")
                         } else {
                             let s = args.to_string();
+                            let s = if self.redact_enabled {
+                                crate::security::redact_internal_paths_in_text_with_config(
+                                    &s,
+                                    &self.redaction_cfg,
+                                )
+                            } else {
+                                s
+                            };
                             format!(": {}", truncate_with_ellipsis(&s, 120))
                         }
                     } else {
                         let s = args.to_string();
+                        let s = if self.redact_enabled {
+                            crate::security::redact_internal_paths_in_text_with_config(
+                                &s,
+                                &self.redaction_cfg,
+                            )
+                        } else {
+                            s
+                        };
                         format!(": {}", truncate_with_ellipsis(&s, 120))
                     }
                 }
@@ -2861,6 +2887,13 @@ async fn process_channel_message(
         None
     };
 
+    // Same rules as final channel send: redact visible draft text for external channels,
+    // while the in-process accumulated reply stays full-fidelity for the LLM/history.
+    let redact_draft_for_channel = msg.channel != "cli"
+        && ctx.prompt_config.security.redact_channel_events
+        && ctx.prompt_config.security.channel_event_redaction.enabled;
+    let draft_redaction_cfg = ctx.prompt_config.security.channel_event_redaction.clone();
+
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
@@ -2881,8 +2914,16 @@ async fn process_channel_message(
                             accumulated.clear();
                         }
                         DraftEvent::Progress(text) => {
+                            let visible = if redact_draft_for_channel {
+                                crate::security::redact_internal_paths_in_text_with_config(
+                                    &text,
+                                    &draft_redaction_cfg,
+                                )
+                            } else {
+                                text
+                            };
                             if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &text)
+                                .update_draft_progress(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft progress update failed: {e}");
@@ -2890,8 +2931,16 @@ async fn process_channel_message(
                         }
                         DraftEvent::Content(text) => {
                             accumulated.push_str(&text);
+                            let visible = if redact_draft_for_channel {
+                                crate::security::redact_internal_paths_in_text_with_config(
+                                    &accumulated,
+                                    &draft_redaction_cfg,
+                                )
+                            } else {
+                                accumulated.clone()
+                            };
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .update_draft(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft update failed: {e}");
@@ -2940,10 +2989,14 @@ async fn process_channel_message(
 
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let redact_enabled =
+        ctx.prompt_config.security.redact_channel_events && ctx.prompt_config.security.channel_event_redaction.enabled;
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
+        redact_enabled,
+        redaction_cfg: ctx.prompt_config.security.channel_event_redaction.clone(),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
     let notify_channel = target_channel.clone();
@@ -3247,6 +3300,21 @@ async fn process_channel_message(
                 }
             }
 
+            // Redact sensitive paths only for the *visible* channel payload (e.g. Telegram).
+            // Session history, memory consolidation, and the next LLM turn keep `delivered_response`
+            // unredacted so the model retains full context.
+            let should_redact_for_channel = msg.channel != "cli"
+                && ctx.prompt_config.security.redact_channel_events
+                && ctx.prompt_config.security.channel_event_redaction.enabled;
+            let channel_visible_response = if should_redact_for_channel {
+                crate::security::redact_internal_paths_in_text_with_config(
+                    &delivered_response,
+                    &ctx.prompt_config.security.channel_event_redaction,
+                )
+            } else {
+                delivered_response.clone()
+            };
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -3314,25 +3382,25 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
+                truncate_with_ellipsis(&channel_visible_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft(&msg.reply_target, draft_id, &channel_visible_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
+                                &SendMessage::new(&channel_visible_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
+                        &SendMessage::new(&channel_visible_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
                             .with_cancellation(cancellation_token.clone()),
                     )
@@ -9249,6 +9317,8 @@ BTC is currently around $65,000 based on latest tool output."#
             inner: Arc::new(NoopObserver),
             tx,
             tools_used: AtomicBool::new(false),
+            redact_enabled: true,
+            redaction_cfg: crate::config::schema::ChannelEventRedactionConfig::default(),
         };
 
         let payload = (0..300)

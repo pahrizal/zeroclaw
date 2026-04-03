@@ -70,19 +70,30 @@ pub async fn handle_sse_events(
     }
 
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(
-        |result: Result<
-            serde_json::Value,
-            tokio_stream::wrappers::errors::BroadcastStreamRecvError,
-        >| {
-            match result {
-                Ok(value) => Some(Ok::<_, Infallible>(
-                    Event::default().data(value.to_string()),
-                )),
-                Err(_) => None, // Skip lagged messages
+    let (redact_enabled, redaction_cfg) = {
+        let cfg = state.config.lock();
+        (
+            cfg.security.redact_channel_events && cfg.security.channel_event_redaction.enabled,
+            cfg.security.channel_event_redaction.clone(),
+        )
+    };
+    let stream = BroadcastStream::new(rx).filter_map(move |result: Result<
+        serde_json::Value,
+        tokio_stream::wrappers::errors::BroadcastStreamRecvError,
+    >| {
+        match result {
+            Ok(mut value) => {
+                if redact_enabled {
+                    crate::security::redact_internal_paths_in_json_with_config(
+                        &mut value,
+                        &redaction_cfg,
+                    );
+                }
+                Some(Ok::<_, Infallible>(Event::default().data(value.to_string())))
             }
-        },
-    );
+            Err(_) => None, // Skip lagged messages
+        }
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
