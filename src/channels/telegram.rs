@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 
 /// Telegram's maximum message length for text messages
@@ -18,6 +19,8 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+/// TTL for caching Telegram chat available reactions (getChat).
+const TELEGRAM_AVAILABLE_REACTIONS_CACHE_TTL_SECS: u64 = 600;
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +344,19 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Cache of per-chat available reactions from `getChat`.
+    /// Keyed by chat_id (stringified i64).
+    available_reactions_cache: Arc<Mutex<HashMap<String, (Instant, TelegramAvailableReactions)>>>,
+}
+
+#[derive(Debug, Clone)]
+enum TelegramAvailableReactions {
+    /// Chat allows all reactions (or bot API did not report restrictions).
+    All,
+    /// Chat restricts reactions to a fixed set of emoji strings.
+    Some(Vec<String>),
+    /// Chat disallows reactions (or allows none).
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +402,7 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            available_reactions_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -607,12 +624,31 @@ impl TelegramChannel {
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
-        let url = self.api_url("setMessageReaction");
-        let emoji = random_telegram_ack_reaction().to_string();
-        let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let set_reaction_url = self.api_url("setMessageReaction");
+        let get_chat_url = self.api_url("getChat");
+        let cache = Arc::clone(&self.available_reactions_cache);
+        let ack_set: Vec<String> = TELEGRAM_ACK_REACTIONS.iter().map(|e| (*e).to_string()).collect();
 
         tokio::spawn(async move {
-            let response = match client.post(&url).json(&body).send().await {
+            let allowed = resolve_allowed_ack_reactions(
+                &client,
+                &get_chat_url,
+                &cache,
+                &chat_id,
+                &ack_set,
+            )
+            .await;
+            let Some(allowed) = allowed else {
+                return;
+            };
+            if allowed.is_empty() {
+                return;
+            }
+
+            let emoji = allowed[pick_uniform_index(allowed.len())].clone();
+            let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+
+            let response = match client.post(&set_reaction_url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
                     tracing::warn!(
@@ -630,6 +666,10 @@ impl TelegramChannel {
                 );
             }
         });
+    }
+
+    fn available_reactions_cache_ttl() -> Duration {
+        Duration::from_secs(TELEGRAM_AVAILABLE_REACTIONS_CACHE_TTL_SECS.max(30))
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -2513,6 +2553,140 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         self.send_media_by_url("sendVoice", "voice", chat_id, thread_id, url, caption)
             .await
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    #[serde(default)]
+    result: Option<T>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TelegramChatInfo {
+    #[serde(default)]
+    available_reactions: Option<TelegramChatAvailableReactions>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TelegramChatAvailableReactions {
+    All,
+    Some { reactions: Vec<TelegramReactionType> },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TelegramReactionType {
+    Emoji { emoji: String },
+    #[serde(other)]
+    Other,
+}
+
+async fn resolve_allowed_ack_reactions(
+    client: &reqwest::Client,
+    get_chat_url: &str,
+    cache: &Arc<Mutex<HashMap<String, (Instant, TelegramAvailableReactions)>>>,
+    chat_id: &str,
+    ack_set: &[String],
+) -> Option<Vec<String>> {
+    // Cache hit
+    {
+        let guard = cache.lock();
+        if let Some((ts, policy)) = guard.get(chat_id) {
+            if ts.elapsed() <= TelegramChannel::available_reactions_cache_ttl() {
+                return allowed_from_policy(policy.clone(), ack_set);
+            }
+        }
+    }
+
+    // Cache miss/stale -> fetch getChat
+    let policy = fetch_chat_available_reactions(client, get_chat_url, chat_id).await;
+    {
+        let mut guard = cache.lock();
+        guard.insert(chat_id.to_string(), (Instant::now(), policy.clone()));
+    }
+
+    allowed_from_policy(policy, ack_set)
+}
+
+fn allowed_from_policy(
+    policy: TelegramAvailableReactions,
+    ack_set: &[String],
+) -> Option<Vec<String>> {
+    match policy {
+        TelegramAvailableReactions::None => None,
+        TelegramAvailableReactions::All => Some(ack_set.to_vec()),
+        TelegramAvailableReactions::Some(allowed) => {
+            let set: HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+            let intersect: Vec<String> = ack_set
+                .iter()
+                .filter(|e| set.contains(e.as_str()))
+                .cloned()
+                .collect();
+            Some(intersect)
+        }
+    }
+}
+
+async fn fetch_chat_available_reactions(
+    client: &reqwest::Client,
+    get_chat_url: &str,
+    chat_id: &str,
+) -> TelegramAvailableReactions {
+    let resp = match client
+        .post(get_chat_url)
+        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("Telegram: getChat failed for chat_id={chat_id}: {e}");
+            // Fail-open: if we can't fetch restrictions, don't break ACKs everywhere.
+            return TelegramAvailableReactions::All;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::debug!("Telegram: getChat non-200 for chat_id={chat_id}: {status} {body}");
+        return TelegramAvailableReactions::All;
+    }
+
+    let parsed = match resp.json::<TelegramApiResponse<TelegramChatInfo>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("Telegram: getChat JSON parse failed for chat_id={chat_id}: {e}");
+            return TelegramAvailableReactions::All;
+        }
+    };
+    if !parsed.ok {
+        return TelegramAvailableReactions::All;
+    }
+    let Some(info) = parsed.result else {
+        return TelegramAvailableReactions::All;
+    };
+
+    match info.available_reactions {
+        None => TelegramAvailableReactions::All,
+        Some(TelegramChatAvailableReactions::All) => TelegramAvailableReactions::All,
+        Some(TelegramChatAvailableReactions::Some { reactions }) => {
+            let allowed: Vec<String> = reactions
+                .into_iter()
+                .filter_map(|r| match r {
+                    TelegramReactionType::Emoji { emoji } => Some(emoji),
+                    TelegramReactionType::Other => None,
+                })
+                .collect();
+            if allowed.is_empty() {
+                TelegramAvailableReactions::None
+            } else {
+                TelegramAvailableReactions::Some(allowed)
+            }
+        }
     }
 }
 
