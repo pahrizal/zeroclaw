@@ -277,6 +277,8 @@ impl WhatsAppChannel {
                         timestamp,
                         thread_ts: None,
                         interruption_scope_id: None,
+                        sender_stable_id: None,
+                        sender_profile: None,
                         attachments: vec![],
                     });
                 }

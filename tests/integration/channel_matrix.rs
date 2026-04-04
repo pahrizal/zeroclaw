@@ -130,6 +130,8 @@ impl Channel for MatrixTestChannel {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
         .await
@@ -626,6 +628,8 @@ fn channel_message_thread_ts_preserved_on_clone() {
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
+        sender_stable_id: None,
+        sender_profile: None,
         attachments: vec![],
     };
 
@@ -644,6 +648,8 @@ fn channel_message_none_thread_ts_preserved() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        sender_stable_id: None,
+        sender_profile: None,
         attachments: vec![],
     };
 
@@ -699,6 +705,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "discord" => ChannelMessage {
@@ -710,6 +718,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "slack" => ChannelMessage {
@@ -721,6 +731,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "imessage" => ChannelMessage {
@@ -732,6 +744,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "irc" => ChannelMessage {
@@ -743,6 +757,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "email" => ChannelMessage {
@@ -754,6 +770,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "signal" => ChannelMessage {
@@ -765,6 +783,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "mattermost" => ChannelMessage {
@@ -776,6 +796,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "whatsapp" => ChannelMessage {
@@ -787,6 +809,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "nextcloud_talk" => ChannelMessage {
@@ -798,6 +822,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "wecom" => ChannelMessage {
@@ -809,6 +835,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "dingtalk" => ChannelMessage {
@@ -820,6 +848,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "qq" => ChannelMessage {
@@ -831,6 +861,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "linq" => ChannelMessage {
@@ -842,6 +874,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "wati" => ChannelMessage {
@@ -853,6 +887,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         "cli" => ChannelMessage {
@@ -864,6 +900,8 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         },
         _ => panic!("Unknown platform: {platform}"),
@@ -1167,6 +1205,8 @@ fn channel_message_zero_timestamp() {
         timestamp: 0,
         thread_ts: None,
         interruption_scope_id: None,
+        sender_stable_id: None,
+        sender_profile: None,
         attachments: vec![],
     };
     assert_eq!(msg.timestamp, 0);
@@ -1183,6 +1223,8 @@ fn channel_message_max_timestamp() {
         timestamp: u64::MAX,
         thread_ts: None,
         interruption_scope_id: None,
+        sender_stable_id: None,
+        sender_profile: None,
         attachments: vec![],
     };
     assert_eq!(msg.timestamp, u64::MAX);

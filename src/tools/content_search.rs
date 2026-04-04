@@ -316,9 +316,9 @@ impl Tool for ContentSearchTool {
         let raw_stdout = String::from_utf8_lossy(&output.stdout);
 
         // --- Parse and format output ---
-        let workspace = &self.security.workspace_dir;
+        let workspace = self.security.effective_workspace_dir();
         let workspace_canon =
-            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
+            std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
 
         let formatted = if self.has_rg {
             format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)

@@ -19,6 +19,7 @@
 //! change guidelines.
 
 pub mod audit;
+pub mod channel_workspace;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;

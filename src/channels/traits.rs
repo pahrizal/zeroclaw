@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+pub use crate::config::per_sender_workspace::SenderProfileHint;
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -18,6 +20,11 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
+    /// Stable platform user id for per-sender workspace isolation (e.g. Telegram numeric `from.id`).
+    /// [`sender`](Self::sender) may still be a username for display.
+    pub sender_stable_id: Option<String>,
+    /// Rich sender metadata when the channel provides it (used for per-sender `USER.md` seeding).
+    pub sender_profile: Option<SenderProfileHint>,
     /// Media attachments (audio, images, video) for the media pipeline.
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
@@ -256,6 +263,8 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -274,6 +283,8 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 

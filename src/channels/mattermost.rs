@@ -464,6 +464,8 @@ impl MattermostChannel {
             timestamp: (create_at / 1000) as u64,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
     }

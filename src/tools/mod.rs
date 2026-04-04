@@ -441,14 +441,8 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-        Arc::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        Arc::new(GitOperationsTool::new(security.clone())),
+        Arc::new(PushoverTool::new(security.clone())),
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
@@ -823,7 +817,7 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; channel map populated later by start_channels.
-    let escalate_tool = EscalateToHumanTool::new(security.clone(), workspace_dir.to_path_buf());
+    let escalate_tool = EscalateToHumanTool::new(security.clone());
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 

@@ -494,6 +494,8 @@ impl GmailPushChannel {
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
+                        sender_stable_id: None,
+                        sender_profile: None,
                         attachments: Vec::new(),
                     };
 

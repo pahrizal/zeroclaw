@@ -226,6 +226,8 @@ impl RedditChannel {
             timestamp,
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
     }

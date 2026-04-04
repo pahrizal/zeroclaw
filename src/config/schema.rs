@@ -462,10 +462,34 @@ pub struct WorkspaceConfig {
     /// Allow searching across workspaces. Default: false (security).
     #[serde(default)]
     pub cross_workspace_search: bool,
+    /// When true, channel messages that include a stable sender id (`sender_stable_id` on inbound messages)
+    /// use a per-user directory under the global workspace, layered `USER.md` / per-user `MEMORY.md` in the system prompt,
+    /// and a distinct memory namespace. Shared `IDENTITY.md` / `SOUL.md` / `AGENTS.md` / skills stay in the global workspace.
+    /// Default: false.
+    #[serde(default)]
+    pub per_sender_isolation: bool,
+    /// Subdirectory of the global `workspace_dir` where per-sender roots are stored (e.g. `per_sender_workspaces/tg_12345/`).
+    #[serde(default = "default_per_sender_subdir")]
+    pub per_sender_subdir: String,
 }
 
 fn default_workspaces_dir() -> String {
     "~/.zeroclaw/workspaces".to_string()
+}
+
+fn default_per_sender_subdir() -> String {
+    "per_sender_workspaces".to_string()
+}
+
+/// How much of the OpenClaw bootstrap bundle is baked into the cached channel daemon system prompt.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBootstrapInjection {
+    /// Inject AGENTS, SOUL, TOOLS, IDENTITY, USER, MEMORY from the global workspace (default).
+    #[default]
+    Full,
+    /// Inject only AGENTS, SOUL, TOOLS, IDENTITY. Per-user USER/MEMORY are appended per message when `per_sender_isolation` is enabled.
+    IdentityOnly,
 }
 
 impl Default for WorkspaceConfig {
@@ -478,6 +502,8 @@ impl Default for WorkspaceConfig {
             isolate_secrets: true,
             isolate_audit: true,
             cross_workspace_search: false,
+            per_sender_isolation: false,
+            per_sender_subdir: default_per_sender_subdir(),
         }
     }
 }

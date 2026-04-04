@@ -499,6 +499,8 @@ impl Channel for DiscordHistoryChannel {
                                 .as_secs(),
                             thread_ts: None,
                             interruption_scope_id: None,
+                            sender_stable_id: None,
+                            sender_profile: None,
                             attachments: Vec::new(),
                         };
                         if tx.send(channel_msg).await.is_err() {

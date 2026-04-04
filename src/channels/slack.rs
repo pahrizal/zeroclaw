@@ -2506,6 +2506,8 @@ impl SlackChannel {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
     }
@@ -2739,6 +2741,8 @@ impl SlackChannel {
                                             .as_secs(),
                                         thread_ts,
                                         interruption_scope_id: scope_id,
+                                        sender_stable_id: None,
+                                        sender_profile: None,
                                         attachments: vec![],
                                     };
                                     tracing::info!(
@@ -2836,6 +2840,8 @@ impl SlackChannel {
                         Self::inbound_thread_ts_genuine_only(event)
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
+                    sender_stable_id: None,
+                    sender_profile: None,
                     attachments: vec![],
                 };
 
@@ -3838,6 +3844,8 @@ impl Channel for SlackChannel {
                                 Self::inbound_thread_ts_genuine_only(msg)
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
+                            sender_stable_id: None,
+                            sender_profile: None,
                             attachments: vec![],
                         };
 
@@ -3922,6 +3930,8 @@ impl Channel for SlackChannel {
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
+                        sender_stable_id: None,
+                        sender_profile: None,
                         attachments: vec![],
                     };
 
@@ -4934,6 +4944,8 @@ mod tests {
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -4960,6 +4972,8 @@ mod tests {
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 

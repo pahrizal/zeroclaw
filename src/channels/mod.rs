@@ -403,6 +403,12 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    /// When true, append per-user USER/MEMORY and use namespaced memory when `sender_stable_id` is set.
+    per_sender_isolation: bool,
+    /// When true, cached system prompt omits USER/MEMORY (IdentityOnly); layered inject includes global USER.
+    per_sender_identity_only_bootstrap: bool,
+    /// Subdirectory name under `workspace_dir` for per-sender roots (`per_sender_subdir/tg_<id>/`).
+    per_sender_subdir: String,
     message_timeout_secs: u64,
     interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: crate::config::MultimodalConfig,
@@ -2554,6 +2560,39 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+
+    let per_user_ws = if ctx.per_sender_isolation {
+        msg.sender_stable_id.as_deref().and_then(|sid| {
+            crate::config::per_sender_workspace::per_user_workspace_dir(
+                ctx.workspace_dir.as_ref(),
+                &ctx.per_sender_subdir,
+                sid,
+            )
+        })
+    } else {
+        None
+    };
+    if let Some(ref p) = per_user_ws {
+        if let Err(e) = crate::config::per_sender_workspace::seed_per_sender_files(p, &msg).await
+        {
+            tracing::warn!(path = %p.display(), "Failed to seed per-sender workspace: {e}");
+        }
+    }
+
+    let memory_for_turn: Arc<dyn Memory> = if ctx.per_sender_isolation {
+        if let Some(ref sid) = msg.sender_stable_id {
+            if let Some(seg) = crate::config::per_sender_workspace::sanitized_segment(sid) {
+                Arc::new(crate::memory::NamespacedMemory::new(Arc::clone(&ctx.memory), seg))
+            } else {
+                Arc::clone(&ctx.memory)
+            }
+        } else {
+            Arc::clone(&ctx.memory)
+        }
+    } else {
+        Arc::clone(&ctx.memory)
+    };
+
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Query classification: override route when a rule matches ──
@@ -2611,8 +2650,7 @@ async fn process_channel_message(
         && !memory::should_skip_autosave_content(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
+        let _ = memory_for_turn
             .store(
                 &autosave_key,
                 &msg.content,
@@ -2720,7 +2758,7 @@ async fn process_channel_message(
 
     let mem_recall_start = Instant::now();
     let sender_memory_fut = build_memory_context(
-        ctx.memory.as_ref(),
+        memory_for_turn.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
         Some(&msg.sender),
@@ -2728,7 +2766,7 @@ async fn process_channel_message(
 
     let (sender_memory, group_memory) = if is_group_chat {
         let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
+            memory_for_turn.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
@@ -2758,11 +2796,30 @@ async fn process_channel_message(
     // Use refreshed system prompt for new sessions (master's /new support),
     // and inject memory into system prompt (not user message) so it
     // doesn't pollute session history and is re-fetched each turn.
-    let base_system_prompt = if had_prior_history {
+    let mut base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
+    if ctx.per_sender_isolation {
+        if let Some(ref p) = per_user_ws {
+            let max_chars = if ctx.prompt_config.agent.compact_context {
+                6000
+            } else {
+                BOOTSTRAP_MAX_CHARS
+            };
+            if ctx.per_sender_identity_only_bootstrap {
+                append_per_sender_layered_user_memory(
+                    &mut base_system_prompt,
+                    ctx.workspace_dir.as_ref(),
+                    p,
+                    max_chars,
+                );
+            } else {
+                append_per_sender_overlay_only(&mut base_system_prompt, p, max_chars);
+            }
+        }
+    }
     let mut system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
     if !memory_context.is_empty() {
@@ -2781,7 +2838,7 @@ async fn process_channel_message(
             cc_config,
             ctx.context_token_budget,
         )
-        .with_memory(Arc::clone(&ctx.memory));
+        .with_memory(Arc::clone(&memory_for_turn));
         match compressor
             .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
             .await
@@ -3045,8 +3102,17 @@ async fn process_channel_message(
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let (llm_result, fallback_info) = scope_provider_fallback(async {
-        let llm_result = loop {
-            let loop_result = tokio::select! {
+        let ws_override = if ctx.per_sender_isolation {
+            per_user_ws.clone()
+        } else {
+            None
+        };
+        crate::security::channel_workspace::CHANNEL_WORKSPACE_OVERRIDE
+            .scope(
+                ws_override,
+                async {
+                    let llm_result = loop {
+                        let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
@@ -3137,8 +3203,11 @@ async fn process_channel_message(
 
             break loop_result;
         };
-        let fb = take_last_provider_fallback();
-        (llm_result, fb)
+                    let fb = take_last_provider_fallback();
+                    (llm_result, fb)
+                },
+            )
+            .await
     })
     .await;
 
@@ -3783,6 +3852,103 @@ async fn run_message_dispatch_loop(
     }
 }
 
+/// Load shared identity bootstrap (AGENTS, SOUL, TOOLS, IDENTITY) without USER/MEMORY.
+fn load_openclaw_bootstrap_identity_only(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    max_chars_per_file: usize,
+) {
+    prompt.push_str(
+        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+    );
+
+    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"];
+
+    for filename in &bootstrap_files {
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+    }
+}
+
+fn apply_openclaw_bootstrap_bundle(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    max_chars: usize,
+    injection: crate::config::WorkspaceBootstrapInjection,
+) {
+    match injection {
+        crate::config::WorkspaceBootstrapInjection::Full => {
+            load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars);
+        }
+        crate::config::WorkspaceBootstrapInjection::IdentityOnly => {
+            load_openclaw_bootstrap_identity_only(prompt, workspace_dir, max_chars);
+        }
+    }
+}
+
+/// Append global USER, per-user USER, and per-user MEMORY for `per_sender_isolation` channel runs.
+fn append_per_sender_layered_user_memory(
+    prompt: &mut String,
+    global_workspace_dir: &std::path::Path,
+    per_user_workspace_dir: &std::path::Path,
+    max_chars_per_file: usize,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        prompt,
+        "\n## Per-user workspace\n\nEffective working directory for this sender: `{}`\n",
+        per_user_workspace_dir.display()
+    );
+    inject_workspace_file_titled(
+        prompt,
+        global_workspace_dir,
+        "USER.md",
+        "USER.md (global shared)",
+        max_chars_per_file,
+    );
+    inject_workspace_file_titled(
+        prompt,
+        per_user_workspace_dir,
+        "USER.md",
+        "USER.md (per-user overlay)",
+        max_chars_per_file,
+    );
+    inject_workspace_file_titled(
+        prompt,
+        per_user_workspace_dir,
+        "MEMORY.md",
+        "MEMORY.md (per-user)",
+        max_chars_per_file,
+    );
+}
+
+/// Per-user USER + MEMORY only (global USER already in Full bootstrap — e.g. AIEOS conflict path).
+fn append_per_sender_overlay_only(
+    prompt: &mut String,
+    per_user_workspace_dir: &std::path::Path,
+    max_chars_per_file: usize,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        prompt,
+        "\n## Per-user workspace\n\nEffective working directory for this sender: `{}`\n",
+        per_user_workspace_dir.display()
+    );
+    inject_workspace_file_titled(
+        prompt,
+        per_user_workspace_dir,
+        "USER.md",
+        "USER.md (per-user overlay)",
+        max_chars_per_file,
+    );
+    inject_workspace_file_titled(
+        prompt,
+        per_user_workspace_dir,
+        "MEMORY.md",
+        "MEMORY.md (per-user)",
+        max_chars_per_file,
+    );
+}
+
 /// Load OpenClaw format bootstrap files into the prompt.
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -3873,6 +4039,7 @@ pub fn build_system_prompt_with_mode(
         skills_prompt_mode,
         false,
         0,
+        crate::config::WorkspaceBootstrapInjection::Full,
     )
 }
 
@@ -3889,6 +4056,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
+    bootstrap_injection: crate::config::WorkspaceBootstrapInjection,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -4031,7 +4199,12 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    apply_openclaw_bootstrap_bundle(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                        bootstrap_injection,
+                    );
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -4039,18 +4212,33 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    apply_openclaw_bootstrap_bundle(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                        bootstrap_injection,
+                    );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            apply_openclaw_bootstrap_bundle(
+                &mut prompt,
+                workspace_dir,
+                max_chars,
+                bootstrap_injection,
+            );
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        apply_openclaw_bootstrap_bundle(
+            &mut prompt,
+            workspace_dir,
+            max_chars,
+            bootstrap_injection,
+        );
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -4114,6 +4302,53 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             .to_string()
     } else {
         prompt
+    }
+}
+
+/// Like [`inject_workspace_file`] but uses a custom markdown heading (e.g. distinguish two USER.md sources).
+fn inject_workspace_file_titled(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    filename: &str,
+    heading: &str,
+    max_chars: usize,
+) {
+    use std::fmt::Write;
+
+    let path = workspace_dir.join(filename);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let _ = writeln!(prompt, "### {heading}\n");
+            let truncated = if trimmed.chars().count() > max_chars {
+                trimmed
+                    .char_indices()
+                    .nth(max_chars)
+                    .map(|(idx, _)| &trimmed[..idx])
+                    .unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            if truncated.len() < trimmed.len() {
+                prompt.push_str(truncated);
+                let _ = writeln!(
+                    prompt,
+                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
+                );
+            } else {
+                prompt.push_str(trimmed);
+                prompt.push_str("\n\n");
+            }
+        }
+        Err(_) => {
+            let _ = writeln!(
+                prompt,
+                "### {heading}\n\n[File not found: {filename}]\n"
+            );
+        }
     }
 }
 
@@ -4396,7 +4631,11 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_per_sender_workspace(
+                    config.workspace.per_sender_isolation,
+                    config.workspace.per_sender_subdir.clone(),
+                ),
             ))
         }
         "discord" => {
@@ -4604,6 +4843,10 @@ fn collect_configured_channels(
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone())
+                .with_per_sender_workspace(
+                    config.workspace.per_sender_isolation,
+                    config.workspace.per_sender_subdir.clone(),
+                )
                 .with_proxy_url(tg.proxy_url.clone()),
             ),
         });
@@ -5421,6 +5664,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
+    let bootstrap_injection =
+        if config.workspace.per_sender_isolation && !crate::identity::is_aieos_configured(&config.identity)
+        {
+            tracing::info!(
+                "Per-sender workspace isolation: using IdentityOnly bootstrap in cached system prompt"
+            );
+            crate::config::WorkspaceBootstrapInjection::IdentityOnly
+        } else {
+            if config.workspace.per_sender_isolation
+                && crate::identity::is_aieos_configured(&config.identity)
+            {
+                tracing::warn!(
+                    "per_sender_isolation is set but AIEOS identity is configured; using Full bootstrap (per-sender USER/MEMORY still applies when sender_stable_id is present)"
+                );
+            }
+            crate::config::WorkspaceBootstrapInjection::Full
+        };
     let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,
@@ -5433,6 +5693,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.skills.prompt_injection_mode,
         config.agent.compact_context,
         config.agent.max_system_prompt_chars,
+        bootstrap_injection,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(
@@ -5496,6 +5757,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if config.workspace.per_sender_isolation {
+        println!(
+            "  👤 Per-sender isolation: on (subdir: {})",
+            config.workspace.per_sender_subdir
+        );
+    }
     println!();
     println!("  Listening for messages... (Ctrl+C to stop)");
     println!();
@@ -5616,6 +5883,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        per_sender_isolation: config.workspace.per_sender_isolation,
+        per_sender_identity_only_bootstrap: config.workspace.per_sender_isolation
+            && !crate::identity::is_aieos_configured(&config.identity),
+        per_sender_subdir: config.workspace.per_sender_subdir.clone(),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
@@ -6093,6 +6364,9 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6217,6 +6491,9 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6298,6 +6575,9 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6396,6 +6676,9 @@ mod tests {
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -6984,6 +7267,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7027,6 +7313,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7074,6 +7362,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7117,6 +7408,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7178,6 +7471,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7221,6 +7517,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7267,6 +7565,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7310,6 +7611,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7366,6 +7669,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7409,6 +7715,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7486,6 +7794,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7529,6 +7840,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7587,6 +7900,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7630,6 +7946,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7703,6 +8021,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..providers::ProviderRuntimeOptions::default()
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7746,6 +8067,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 4,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7804,6 +8127,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7850,6 +8176,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7898,6 +8226,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7944,6 +8275,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8118,6 +8451,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8160,6 +8496,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
         .await
@@ -8173,6 +8511,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
         .await
@@ -8230,6 +8570,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8273,6 +8616,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8287,6 +8632,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8361,6 +8708,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8404,6 +8754,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8418,6 +8770,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8489,6 +8843,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8532,6 +8889,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8546,6 +8905,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -8595,6 +8956,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8638,6 +9002,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8682,6 +9048,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8725,6 +9094,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8769,6 +9140,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8812,6 +9186,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9200,6 +9576,7 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::config::SkillsPromptInjectionMode::Full,
             false,
             0,
+            crate::config::WorkspaceBootstrapInjection::Full,
         );
 
         assert!(
@@ -9231,6 +9608,7 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::config::SkillsPromptInjectionMode::Full,
             false,
             0,
+            crate::config::WorkspaceBootstrapInjection::Full,
         );
 
         assert!(
@@ -9350,6 +9728,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -9367,6 +9747,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -9387,6 +9769,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -9404,6 +9788,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         let msg2 = traits::ChannelMessage {
@@ -9415,6 +9801,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -9438,6 +9826,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         let msg2 = traits::ChannelMessage {
@@ -9449,6 +9839,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
 
@@ -9563,6 +9955,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -9606,6 +10001,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9623,6 +10020,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9704,6 +10103,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.workspace_dir.clone()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(config.clone()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -9747,6 +10149,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9780,6 +10184,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9819,6 +10225,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9888,6 +10296,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -9931,6 +10342,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10004,6 +10417,9 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -10047,6 +10463,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10591,6 +11009,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -10635,6 +11056,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10687,6 +11110,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -10730,6 +11156,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10747,6 +11175,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10817,6 +11247,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -10860,6 +11293,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10877,6 +11312,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10991,6 +11428,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11034,6 +11474,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11111,6 +11553,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11154,6 +11599,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11223,6 +11670,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11266,6 +11716,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11355,6 +11807,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11398,6 +11853,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11556,6 +12013,8 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
@@ -11572,6 +12031,8 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
@@ -11589,6 +12050,8 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
@@ -11628,6 +12091,9 @@ This is an example JSON object for profile settings."#;
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -11673,6 +12139,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await
@@ -11687,6 +12155,8 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await

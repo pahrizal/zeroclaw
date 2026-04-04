@@ -8,15 +8,11 @@ use std::sync::Arc;
 /// Provides safe, parsed git operations with JSON output.
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
-    workspace_dir: std::path::PathBuf,
 }
 
 impl GitOperationsTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
-        Self {
-            security,
-            workspace_dir,
-        }
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
     }
 
     /// Sanitize git arguments to prevent injection attacks
@@ -69,26 +65,26 @@ impl GitOperationsTool {
     /// Returns the workspace_dir if no path is provided.
     /// Rejects paths that escape the workspace via traversal.
     fn resolve_working_dir(&self, path: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+        let workspace_dir = self.security.effective_workspace_dir();
         let base = match path {
             Some(p) if !p.is_empty() => {
                 let candidate = if std::path::Path::new(p).is_absolute() {
                     std::path::PathBuf::from(p)
                 } else {
-                    self.workspace_dir.join(p)
+                    workspace_dir.join(p)
                 };
                 let resolved = candidate
                     .canonicalize()
                     .map_err(|e| anyhow::anyhow!("Cannot resolve path '{}': {}", p, e))?;
-                let workspace_canonical = self
-                    .workspace_dir
+                let workspace_canonical = workspace_dir
                     .canonicalize()
-                    .unwrap_or_else(|_| self.workspace_dir.clone());
+                    .unwrap_or_else(|_| workspace_dir.clone());
                 if !resolved.starts_with(&workspace_canonical) {
                     anyhow::bail!("Path '{}' resolves outside the workspace directory", p);
                 }
                 resolved
             }
-            _ => self.workspace_dir.clone(),
+            _ => workspace_dir,
         };
         Ok(base)
     }
@@ -672,7 +668,7 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     #[test]
@@ -799,7 +795,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         let result = tool
             .execute(json!({"operation": "commit", "message": "test"}))
@@ -830,7 +826,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
         // Branch listing must not be blocked by read-only autonomy
@@ -848,7 +844,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();

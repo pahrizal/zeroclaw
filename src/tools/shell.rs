@@ -161,7 +161,7 @@ impl Tool for ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(command, &self.security.effective_workspace_dir())
         {
             Ok(cmd) => cmd,
             Err(e) => {

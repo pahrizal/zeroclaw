@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::per_sender_workspace::SenderProfileHint;
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -337,6 +338,9 @@ pub struct TelegramChannel {
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// When true, incoming attachments use `per_sender_subdir/tg_<id>/telegram_files/`.
+    per_sender_isolation: bool,
+    per_sender_subdir: String,
     ack_reactions: bool,
     tts_config: Option<crate::config::TtsConfig>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -397,6 +401,8 @@ impl TelegramChannel {
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            per_sender_isolation: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             ack_reactions: true,
             tts_config: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -552,6 +558,14 @@ impl TelegramChannel {
     /// Configure workspace directory for saving downloaded attachments.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// When `[workspace] per_sender_isolation` is enabled, store Telegram downloads
+    /// under `{workspace}/{per_sender_subdir}/tg_<sender_id>/telegram_files/`.
+    pub fn with_per_sender_workspace(mut self, isolation: bool, subdir: String) -> Self {
+        self.per_sender_isolation = isolation;
+        self.per_sender_subdir = subdir;
         self
     }
 
@@ -1287,12 +1301,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         self.log_incoming_decision(message, "ACCEPTED", None);
 
         // Ensure workspace directory is configured
-        let workspace = self.workspace_dir.as_ref().or_else(|| {
+        let global = self.workspace_dir.as_ref().or_else(|| {
             tracing::warn!("Cannot save attachment: workspace_dir not configured");
             None
         })?;
 
-        let save_dir = workspace.join("telegram_files");
+        let base: std::path::PathBuf = if self.per_sender_isolation {
+            sender_id
+                .as_ref()
+                .and_then(|sid| {
+                    crate::config::per_sender_workspace::per_user_workspace_dir(
+                        global,
+                        &self.per_sender_subdir,
+                        sid,
+                    )
+                })
+                .unwrap_or_else(|| global.clone())
+        } else {
+            global.clone()
+        };
+
+        let save_dir = base.join("telegram_files");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("Failed to create telegram_files directory: {e}");
             return None;
@@ -1365,6 +1394,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -1511,6 +1544,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -1534,6 +1571,42 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             username.clone()
         };
         (username, sender_id, sender_identity)
+    }
+
+    /// Build [`SenderProfileHint`] from a Telegram Bot API `from` user object.
+    fn telegram_sender_profile(from: &serde_json::Value) -> Option<SenderProfileHint> {
+        from.get("id")?;
+        let first = from
+            .get("first_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let last = from
+            .get("last_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let display_name = match (first.is_empty(), last.is_empty()) {
+            (false, false) => Some(format!("{first} {last}")),
+            (false, true) => Some(first.to_string()),
+            (true, false) => Some(last.to_string()),
+            (true, true) => None,
+        };
+        Some(SenderProfileHint {
+            display_name,
+            username: from
+                .get("username")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::string::ToString::to_string),
+            language_code: from
+                .get("language_code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::string::ToString::to_string),
+        })
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.
@@ -1727,6 +1800,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
