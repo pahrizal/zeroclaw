@@ -49,6 +49,8 @@ impl Channel for CliChannel {
                     .as_secs(),
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             };
 
@@ -79,6 +81,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 cancellation_token: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await;
@@ -95,6 +98,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 cancellation_token: None,
+                sender_profile: None,
                 attachments: vec![],
             })
             .await;
@@ -118,6 +122,8 @@ mod tests {
             timestamp: 1_234_567_890,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         assert_eq!(msg.id, "test-id");
@@ -139,6 +145,8 @@ mod tests {
             timestamp: 0,
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         };
         let cloned = msg.clone();

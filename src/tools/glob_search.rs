@@ -105,8 +105,8 @@ impl Tool for GlobSearchTool {
             }
         };
 
-        let workspace = &self.security.workspace_dir;
-        let workspace_canon = match std::fs::canonicalize(workspace) {
+        let workspace = self.security.effective_workspace_dir();
+        let workspace_canon = match std::fs::canonicalize(&workspace) {
             Ok(p) => p,
             Err(e) => {
                 return Ok(ToolResult {

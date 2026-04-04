@@ -304,6 +304,8 @@ mod tests {
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             };
             let _ = tx.send(msg).await;

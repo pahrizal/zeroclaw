@@ -172,6 +172,7 @@ rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
+globset = "0.4"
 
 # email
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }

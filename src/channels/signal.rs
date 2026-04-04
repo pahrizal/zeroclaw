@@ -280,6 +280,8 @@ impl SignalChannel {
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             interruption_scope_id: None,
+            sender_stable_id: None,
+            sender_profile: None,
             attachments: vec![],
         })
     }
@@ -497,6 +499,7 @@ mod tests {
                 message: Some(m.to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                sender_profile: None,
                 attachments: None,
             }),
             story_message: None,
@@ -572,6 +575,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            sender_profile: None,
             attachments: None,
         };
         assert!(ch.matches_group(&dm));
@@ -582,6 +586,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            sender_profile: None,
             attachments: None,
         };
         assert!(ch.matches_group(&group));
@@ -596,6 +601,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            sender_profile: None,
             attachments: None,
         };
         assert!(ch.matches_group(&matching));
@@ -606,6 +612,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("other_group".to_string()),
             }),
+            sender_profile: None,
             attachments: None,
         };
         assert!(!ch.matches_group(&non_matching));
@@ -618,6 +625,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            sender_profile: None,
             attachments: None,
         };
         assert!(ch.matches_group(&dm));
@@ -628,6 +636,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            sender_profile: None,
             attachments: None,
         };
         assert!(!ch.matches_group(&group));
@@ -640,6 +649,7 @@ mod tests {
             message: Some("hi".to_string()),
             timestamp: Some(1000),
             group_info: None,
+            sender_profile: None,
             attachments: None,
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
@@ -654,6 +664,7 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
             }),
+            sender_profile: None,
             attachments: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
@@ -752,6 +763,7 @@ mod tests {
                 message: Some("Hello from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                sender_profile: None,
                 attachments: None,
             }),
             story_message: None,
@@ -787,6 +799,7 @@ mod tests {
                 group_info: Some(GroupInfo {
                     group_id: Some("testgroup".to_string()),
                 }),
+                sender_profile: None,
                 attachments: None,
             }),
             story_message: None,
@@ -862,6 +875,7 @@ mod tests {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
+                sender_profile: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
             }),
             story_message: None,

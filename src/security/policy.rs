@@ -1331,6 +1331,17 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
+    /// Workspace root for tool path resolution and shell cwd.
+    ///
+    /// When a channel sets [`crate::security::channel_workspace::CHANNEL_WORKSPACE_OVERRIDE`]
+    /// (per-sender isolation), returns that directory; otherwise the configured
+    /// [`SecurityPolicy::workspace_dir`].
+    #[must_use]
+    pub fn effective_workspace_dir(&self) -> PathBuf {
+        crate::security::channel_workspace::channel_workspace_override()
+            .unwrap_or_else(|| self.workspace_dir.clone())
+    }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -1368,6 +1379,9 @@ impl SecurityPolicy {
         // "/home" are not rejected.  This mirrors the priority order in
         // `is_resolved_path_allowed`.  See #2880.
         if expanded_path.is_absolute() {
+            // Use the configured global workspace root so shared files at the workspace
+            // top level remain reachable while per-sender isolation only affects
+            // relative resolution via [`Self::effective_workspace_dir`].
             let in_workspace = expanded_path.starts_with(&self.workspace_dir);
             let in_allowed_root = self
                 .allowed_roots
@@ -1545,20 +1559,21 @@ impl SecurityPolicy {
     /// the filesystem path that the tool actually operates on.
     pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
         let expanded = expand_user_path(path);
+        let root = self.effective_workspace_dir();
         if expanded.is_absolute() {
             expanded
-        } else if let Some(workspace_hint) = rootless_path(&self.workspace_dir) {
+        } else if let Some(workspace_hint) = rootless_path(&root) {
             if let Ok(stripped) = expanded.strip_prefix(&workspace_hint) {
                 if stripped.as_os_str().is_empty() {
-                    self.workspace_dir.clone()
+                    root
                 } else {
-                    self.workspace_dir.join(stripped)
+                    root.join(stripped)
                 }
             } else {
-                self.workspace_dir.join(expanded)
+                root.join(expanded)
             }
         } else {
-            self.workspace_dir.join(expanded)
+            root.join(expanded)
         }
     }
 
@@ -1629,7 +1644,7 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Workspace boundary**: file operations are restricted to `{}`.",
-                self.workspace_dir.display()
+                self.effective_workspace_dir().display()
             );
         }
 

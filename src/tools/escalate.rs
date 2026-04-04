@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 const PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
@@ -27,15 +26,13 @@ const VALID_URGENCY_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
 pub struct EscalateToHumanTool {
     security: Arc<SecurityPolicy>,
     channel_map: ChannelMapHandle,
-    workspace_dir: PathBuf,
 }
 
 impl EscalateToHumanTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             security,
             channel_map: Arc::new(RwLock::new(HashMap::new())),
-            workspace_dir,
         }
     }
 
@@ -71,7 +68,7 @@ impl EscalateToHumanTool {
 
     /// Try to read Pushover credentials from .env file. Returns None if unavailable.
     async fn get_pushover_credentials(&self) -> Option<(String, String)> {
-        let env_path = self.workspace_dir.join(".env");
+        let env_path = self.security.effective_workspace_dir().join(".env");
         let content = tokio::fs::read_to_string(&env_path).await.ok()?;
 
         let mut token = None;
@@ -426,6 +423,8 @@ mod tests {
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             };
             let _ = tx.send(msg).await;
@@ -435,7 +434,7 @@ mod tests {
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
         let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()));
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -449,7 +448,7 @@ mod tests {
     #[test]
     fn test_tool_metadata() {
         let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()));
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -460,7 +459,7 @@ mod tests {
     #[test]
     fn test_parameters_schema() {
         let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());

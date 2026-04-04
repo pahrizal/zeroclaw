@@ -140,7 +140,7 @@ impl Tool for SkillShellTool {
         // Build and execute the command
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        cmd.current_dir(self.security.effective_workspace_dir());
         cmd.env_clear();
 
         // Only pass safe environment variables

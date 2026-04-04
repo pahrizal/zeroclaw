@@ -132,7 +132,7 @@ impl Tool for ClaudeCodeTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            let workspace = &self.security.workspace_dir;
+            let workspace = self.security.effective_workspace_dir();
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
@@ -146,7 +146,7 @@ impl Tool for ClaudeCodeTool {
                     });
                 }
             };
-            let canonical_ws = match workspace.canonicalize() {
+            let canonical_ws = match std::path::Path::canonicalize(&workspace) {
                 Ok(p) => p,
                 Err(_) => {
                     return Ok(ToolResult {
@@ -172,7 +172,7 @@ impl Tool for ClaudeCodeTool {
             }
             canonical_wd
         } else {
-            self.security.workspace_dir.clone()
+            self.security.effective_workspace_dir()
         };
 
         // Record action budget

@@ -381,6 +381,17 @@ async fn handle_socket(
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event {
+                    let (redact_enabled, redaction_cfg) = {
+                        let cfg = state.config.lock();
+                        (
+                            cfg.security.redact_channel_events && cfg.security.channel_event_redaction.enabled,
+                            cfg.security.channel_event_redaction.clone(),
+                        )
+                    };
+                    let mut event = event;
+                    if redact_enabled {
+                        crate::security::redact_internal_paths_in_json_with_config(&mut event, &redaction_cfg);
+                    }
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
             }
@@ -436,7 +447,7 @@ async fn process_chat_message(
     // and we relay them over WebSocket.
     let forward_fut = async {
         while let Some(event) = event_rx.recv().await {
-            let ws_msg = match event {
+            let mut ws_msg = match event {
                 TurnEvent::Chunk { delta } => {
                     serde_json::json!({ "type": "chunk", "content": delta })
                 }
@@ -450,6 +461,16 @@ async fn process_chat_message(
                     serde_json::json!({ "type": "tool_result", "name": name, "output": output })
                 }
             };
+            let (redact_enabled, redaction_cfg) = {
+                let cfg = state.config.lock();
+                (
+                    cfg.security.redact_channel_events && cfg.security.channel_event_redaction.enabled,
+                    cfg.security.channel_event_redaction.clone(),
+                )
+            };
+            if redact_enabled {
+                crate::security::redact_internal_paths_in_json_with_config(&mut ws_msg, &redaction_cfg);
+            }
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }
     };

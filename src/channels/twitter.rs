@@ -289,6 +289,8 @@ impl Channel for TwitterChannel {
                                     .and_then(|c| c.as_str())
                                     .map(|s| s.to_string()),
                                 interruption_scope_id: None,
+                                sender_stable_id: None,
+                                sender_profile: None,
                                 attachments: vec![],
                             };
 

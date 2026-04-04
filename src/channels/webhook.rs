@@ -238,6 +238,8 @@ impl Channel for WebhookChannel {
                 timestamp,
                 thread_ts: payload.thread_id,
                 interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
                 attachments: vec![],
             };
 

@@ -1,4 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::per_sender_workspace::SenderProfileHint;
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -6,10 +7,11 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 
 /// Telegram's maximum message length for text messages
@@ -18,6 +20,8 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+/// TTL for caching Telegram chat available reactions (getChat).
+const TELEGRAM_AVAILABLE_REACTIONS_CACHE_TTL_SECS: u64 = 600;
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +329,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    allowed_message_thread_ids: Option<std::collections::HashSet<i64>>,
     bot_username: Mutex<Option<String>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
@@ -333,6 +338,9 @@ pub struct TelegramChannel {
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// When true, incoming attachments use `per_sender_subdir/tg_<id>/telegram_files/`.
+    per_sender_isolation: bool,
+    per_sender_subdir: String,
     ack_reactions: bool,
     tts_config: Option<crate::config::TtsConfig>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -340,6 +348,19 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Cache of per-chat available reactions from `getChat`.
+    /// Keyed by chat_id (stringified i64).
+    available_reactions_cache: Arc<Mutex<HashMap<String, (Instant, TelegramAvailableReactions)>>>,
+}
+
+#[derive(Debug, Clone)]
+enum TelegramAvailableReactions {
+    /// Chat allows all reactions (or bot API did not report restrictions).
+    All,
+    /// Chat restricts reactions to a fixed set of emoji strings.
+    Some(Vec<String>),
+    /// Chat disallows reactions (or allows none).
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,18 +394,153 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            allowed_message_thread_ids: Self::parse_allowed_message_thread_ids_from_env(),
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            per_sender_isolation: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
             ack_reactions: true,
             tts_config: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            available_reactions_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn parse_allowed_message_thread_ids_from_env(
+    ) -> Option<std::collections::HashSet<i64>> {
+        const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_ALLOWED_MESSAGE_THREAD_IDS";
+        let raw = std::env::var(ENV_KEY).ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "*" {
+            return None;
+        }
+
+        let mut out = std::collections::HashSet::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "*" {
+                return None;
+            }
+            if let Ok(id) = part.parse::<i64>() {
+                out.insert(id);
+            } else {
+                tracing::warn!("{ENV_KEY}: ignoring invalid thread id: {part}");
+            }
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn debug_incoming_enabled() -> bool {
+        const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_DEBUG_INCOMING";
+        std::env::var(ENV_KEY)
+            .ok()
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
+    fn log_incoming_decision(
+        &self,
+        message: &serde_json::Value,
+        decision: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        if !Self::debug_incoming_enabled() {
+            return;
+        }
+
+        let chat = message.get("chat");
+        let chat_id = chat
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64);
+        let chat_type = chat
+            .and_then(|c| c.get("type"))
+            .and_then(serde_json::Value::as_str);
+
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64);
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+
+        let from = message.get("from");
+        let sender_id = from
+            .and_then(|f| f.get("id"))
+            .and_then(serde_json::Value::as_i64);
+        let username = from
+            .and_then(|f| f.get("username"))
+            .and_then(serde_json::Value::as_str);
+
+        let is_group = Self::is_group_message(message);
+        let has_text = message.get("text").and_then(serde_json::Value::as_str).is_some();
+        let has_caption = message
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+
+        if let Some(reason) = reason {
+            tracing::info!(
+                target: "zeroclaw::channels::telegram",
+                event = "incoming_message",
+                decision,
+                reason,
+                chat_id,
+                chat_type,
+                message_id,
+                message_thread_id = thread_id,
+                sender_id,
+                username,
+                is_group,
+                mention_only = self.mention_only,
+                has_text,
+                has_caption,
+                "Telegram incoming message filtered"
+            );
+        } else {
+            tracing::info!(
+                target: "zeroclaw::channels::telegram",
+                event = "incoming_message",
+                decision,
+                chat_id,
+                chat_type,
+                message_id,
+                message_thread_id = thread_id,
+                sender_id,
+                username,
+                is_group,
+                mention_only = self.mention_only,
+                has_text,
+                has_caption,
+                "Telegram incoming message accepted"
+            );
+        }
+    }
+
+    fn is_message_thread_allowed(&self, message: &serde_json::Value) -> bool {
+        let Some(allowed) = self.allowed_message_thread_ids.as_ref() else {
+            return true;
+        };
+
+        // If filtering is enabled, require a thread id and require it to match.
+        // This makes the filter strict for forum-topic workflows.
+        let Some(thread_id) = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return false;
+        };
+
+        allowed.contains(&thread_id)
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -402,6 +558,14 @@ impl TelegramChannel {
     /// Configure workspace directory for saving downloaded attachments.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// When `[workspace] per_sender_isolation` is enabled, store Telegram downloads
+    /// under `{workspace}/{per_sender_subdir}/tg_<sender_id>/telegram_files/`.
+    pub fn with_per_sender_workspace(mut self, isolation: bool, subdir: String) -> Self {
+        self.per_sender_isolation = isolation;
+        self.per_sender_subdir = subdir;
         self
     }
 
@@ -474,12 +638,31 @@ impl TelegramChannel {
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
-        let url = self.api_url("setMessageReaction");
-        let emoji = random_telegram_ack_reaction().to_string();
-        let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let set_reaction_url = self.api_url("setMessageReaction");
+        let get_chat_url = self.api_url("getChat");
+        let cache = Arc::clone(&self.available_reactions_cache);
+        let ack_set: Vec<String> = TELEGRAM_ACK_REACTIONS.iter().map(|e| (*e).to_string()).collect();
 
         tokio::spawn(async move {
-            let response = match client.post(&url).json(&body).send().await {
+            let allowed = resolve_allowed_ack_reactions(
+                &client,
+                &get_chat_url,
+                &cache,
+                &chat_id,
+                &ack_set,
+            )
+            .await;
+            let Some(allowed) = allowed else {
+                return;
+            };
+            if allowed.is_empty() {
+                return;
+            }
+
+            let emoji = allowed[pick_uniform_index(allowed.len())].clone();
+            let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+
+            let response = match client.post(&set_reaction_url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
                     tracing::warn!(
@@ -497,6 +680,10 @@ impl TelegramChannel {
                 );
             }
         });
+    }
+
+    fn available_reactions_cache_ttl() -> Duration {
+        Duration::from_secs(TELEGRAM_AVAILABLE_REACTIONS_CACHE_TTL_SECS.max(30))
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -1046,6 +1233,25 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
         let attachment = Self::parse_attachment_metadata(message)?;
+        let is_group = Self::is_group_message(message);
+
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
+
+        if self.mention_only && is_group {
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let bot_username = self.bot_username.lock();
+            let bot_username = bot_username.as_ref()?;
+            if !Self::contains_bot_mention(caption, bot_username) {
+                self.log_incoming_decision(message, "FILTERED", Some("missing_bot_mention_in_caption"));
+                return None;
+            }
+        }
 
         // Check file size limit
         if let Some(size) = attachment.file_size {
@@ -1066,6 +1272,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
@@ -1091,13 +1298,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
+        self.log_incoming_decision(message, "ACCEPTED", None);
+
         // Ensure workspace directory is configured
-        let workspace = self.workspace_dir.as_ref().or_else(|| {
+        let global = self.workspace_dir.as_ref().or_else(|| {
             tracing::warn!("Cannot save attachment: workspace_dir not configured");
             None
         })?;
 
-        let save_dir = workspace.join("telegram_files");
+        let base: std::path::PathBuf = if self.per_sender_isolation {
+            sender_id
+                .as_ref()
+                .and_then(|sid| {
+                    crate::config::per_sender_workspace::per_user_workspace_dir(
+                        global,
+                        &self.per_sender_subdir,
+                        sid,
+                    )
+                })
+                .unwrap_or_else(|| global.clone())
+        } else {
+            global.clone()
+        };
+
+        let save_dir = base.join("telegram_files");
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("Failed to create telegram_files directory: {e}");
             return None;
@@ -1170,6 +1394,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -1182,6 +1410,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let config = self.transcription.as_ref()?;
         let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
+        let is_group = Self::is_group_message(message);
+
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
+
+        // Voice messages have no text to @mention the bot; keep group behavior strict.
+        if self.mention_only && is_group {
+            self.log_incoming_decision(message, "FILTERED", Some("voice_in_group_requires_mention"));
+            return None;
+        }
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
 
@@ -1201,6 +1441,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
@@ -1225,6 +1466,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        self.log_incoming_decision(message, "ACCEPTED", None);
 
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
@@ -1301,6 +1544,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -1324,6 +1571,42 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             username.clone()
         };
         (username, sender_id, sender_identity)
+    }
+
+    /// Build [`SenderProfileHint`] from a Telegram Bot API `from` user object.
+    fn telegram_sender_profile(from: &serde_json::Value) -> Option<SenderProfileHint> {
+        from.get("id")?;
+        let first = from
+            .get("first_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let last = from
+            .get("last_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let display_name = match (first.is_empty(), last.is_empty()) {
+            (false, false) => Some(format!("{first} {last}")),
+            (false, true) => Some(first.to_string()),
+            (true, false) => Some(last.to_string()),
+            (true, true) => None,
+        };
+        Some(SenderProfileHint {
+            display_name,
+            username: from
+                .get("username")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::string::ToString::to_string),
+            language_code: from
+                .get("language_code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::string::ToString::to_string),
+        })
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.
@@ -1413,7 +1696,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .collect::<Vec<_>>()
             .join("\n");
 
-        Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+        // Keep reply context, but do NOT include usernames/names: downstream routing can
+        // misclassify messages as "addressed to <name>, not the assistant".
+        Some(format!("> Reply context:\n{quoted_lines}"))
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
@@ -1429,17 +1714,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            self.log_incoming_decision(message, "FILTERED", Some("unauthorized_sender"));
             return None;
         }
 
         let is_group = Self::is_group_message(message);
+        if is_group && !self.is_message_thread_allowed(message) {
+            self.log_incoming_decision(message, "FILTERED", Some("thread_not_allowed"));
+            return None;
+        }
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
                 if !Self::contains_bot_mention(text, bot_username) {
+                    self.log_incoming_decision(message, "FILTERED", Some("missing_bot_mention"));
                     return None;
                 }
             } else {
+                self.log_incoming_decision(message, "FILTERED", Some("bot_username_unknown"));
                 return None;
             }
         }
@@ -1467,6 +1759,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
+
+        self.log_incoming_decision(message, "ACCEPTED", None);
 
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
@@ -1506,6 +1800,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            sender_stable_id: sender_id.clone(),
+            sender_profile: message
+                .get("from")
+                .and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -2332,6 +2630,140 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         self.send_media_by_url("sendVoice", "voice", chat_id, thread_id, url, caption)
             .await
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    #[serde(default)]
+    result: Option<T>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct TelegramChatInfo {
+    #[serde(default)]
+    available_reactions: Option<TelegramChatAvailableReactions>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TelegramChatAvailableReactions {
+    All,
+    Some { reactions: Vec<TelegramReactionType> },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TelegramReactionType {
+    Emoji { emoji: String },
+    #[serde(other)]
+    Other,
+}
+
+async fn resolve_allowed_ack_reactions(
+    client: &reqwest::Client,
+    get_chat_url: &str,
+    cache: &Arc<Mutex<HashMap<String, (Instant, TelegramAvailableReactions)>>>,
+    chat_id: &str,
+    ack_set: &[String],
+) -> Option<Vec<String>> {
+    // Cache hit
+    {
+        let guard = cache.lock();
+        if let Some((ts, policy)) = guard.get(chat_id) {
+            if ts.elapsed() <= TelegramChannel::available_reactions_cache_ttl() {
+                return allowed_from_policy(policy.clone(), ack_set);
+            }
+        }
+    }
+
+    // Cache miss/stale -> fetch getChat
+    let policy = fetch_chat_available_reactions(client, get_chat_url, chat_id).await;
+    {
+        let mut guard = cache.lock();
+        guard.insert(chat_id.to_string(), (Instant::now(), policy.clone()));
+    }
+
+    allowed_from_policy(policy, ack_set)
+}
+
+fn allowed_from_policy(
+    policy: TelegramAvailableReactions,
+    ack_set: &[String],
+) -> Option<Vec<String>> {
+    match policy {
+        TelegramAvailableReactions::None => None,
+        TelegramAvailableReactions::All => Some(ack_set.to_vec()),
+        TelegramAvailableReactions::Some(allowed) => {
+            let set: HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+            let intersect: Vec<String> = ack_set
+                .iter()
+                .filter(|e| set.contains(e.as_str()))
+                .cloned()
+                .collect();
+            Some(intersect)
+        }
+    }
+}
+
+async fn fetch_chat_available_reactions(
+    client: &reqwest::Client,
+    get_chat_url: &str,
+    chat_id: &str,
+) -> TelegramAvailableReactions {
+    let resp = match client
+        .post(get_chat_url)
+        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("Telegram: getChat failed for chat_id={chat_id}: {e}");
+            // Fail-open: if we can't fetch restrictions, don't break ACKs everywhere.
+            return TelegramAvailableReactions::All;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        tracing::debug!("Telegram: getChat non-200 for chat_id={chat_id}: {status} {body}");
+        return TelegramAvailableReactions::All;
+    }
+
+    let parsed = match resp.json::<TelegramApiResponse<TelegramChatInfo>>().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("Telegram: getChat JSON parse failed for chat_id={chat_id}: {e}");
+            return TelegramAvailableReactions::All;
+        }
+    };
+    if !parsed.ok {
+        return TelegramAvailableReactions::All;
+    }
+    let Some(info) = parsed.result else {
+        return TelegramAvailableReactions::All;
+    };
+
+    match info.available_reactions {
+        None => TelegramAvailableReactions::All,
+        Some(TelegramChatAvailableReactions::All) => TelegramAvailableReactions::All,
+        Some(TelegramChatAvailableReactions::Some { reactions }) => {
+            let allowed: Vec<String> = reactions
+                .into_iter()
+                .filter_map(|r| match r {
+                    TelegramReactionType::Emoji { emoji } => Some(emoji),
+                    TelegramReactionType::Other => None,
+                })
+                .collect();
+            if allowed.is_empty() {
+                TelegramAvailableReactions::None
+            } else {
+                TelegramAvailableReactions::Some(allowed)
+            }
+        }
     }
 }
 

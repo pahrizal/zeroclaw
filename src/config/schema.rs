@@ -462,10 +462,34 @@ pub struct WorkspaceConfig {
     /// Allow searching across workspaces. Default: false (security).
     #[serde(default)]
     pub cross_workspace_search: bool,
+    /// When true, channel messages that include a stable sender id (`sender_stable_id` on inbound messages)
+    /// use a per-user directory under the global workspace, layered `USER.md` / per-user `MEMORY.md` in the system prompt,
+    /// and a distinct memory namespace. Shared `IDENTITY.md` / `SOUL.md` / `AGENTS.md` / skills stay in the global workspace.
+    /// Default: false.
+    #[serde(default)]
+    pub per_sender_isolation: bool,
+    /// Subdirectory of the global `workspace_dir` where per-sender roots are stored (e.g. `per_sender_workspaces/tg_12345/`).
+    #[serde(default = "default_per_sender_subdir")]
+    pub per_sender_subdir: String,
 }
 
 fn default_workspaces_dir() -> String {
     "~/.zeroclaw/workspaces".to_string()
+}
+
+fn default_per_sender_subdir() -> String {
+    "per_sender_workspaces".to_string()
+}
+
+/// How much of the OpenClaw bootstrap bundle is baked into the cached channel daemon system prompt.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceBootstrapInjection {
+    /// Inject AGENTS, SOUL, TOOLS, IDENTITY, USER, MEMORY from the global workspace (default).
+    #[default]
+    Full,
+    /// Inject only AGENTS, SOUL, TOOLS, IDENTITY. Per-user USER/MEMORY are appended per message when `per_sender_isolation` is enabled.
+    IdentityOnly,
 }
 
 impl Default for WorkspaceConfig {
@@ -478,6 +502,8 @@ impl Default for WorkspaceConfig {
             isolate_secrets: true,
             isolate_audit: true,
             cross_workspace_search: false,
+            per_sender_isolation: false,
+            per_sender_subdir: default_per_sender_subdir(),
         }
     }
 }
@@ -7239,7 +7265,7 @@ impl ChannelConfig for FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecurityConfig {
     /// Sandbox configuration
     #[serde(default)]
@@ -7252,6 +7278,18 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// Redact internal ZeroClaw workspace artifacts (skills/, telegram_files/,
+    /// SOUL.md/AGENTS.md/USER.md, etc.) from outbound channel events and
+    /// real-time gateway event payloads.
+    ///
+    /// Default: true (privacy-by-default).
+    #[serde(default = "default_true")]
+    pub redact_channel_events: bool,
+
+    /// Fine-grained configuration for channel event redaction.
+    #[serde(default)]
+    pub channel_event_redaction: ChannelEventRedactionConfig,
 
     /// OTP gating configuration for sensitive actions/domains.
     #[serde(default)]
@@ -7268,6 +7306,74 @@ pub struct SecurityConfig {
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     pub webauthn: WebAuthnConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            redact_channel_events: default_true(),
+            channel_event_redaction: ChannelEventRedactionConfig::default(),
+            otp: OtpConfig::default(),
+            estop: EstopConfig::default(),
+            nevis: NevisConfig::default(),
+            webauthn: WebAuthnConfig::default(),
+        }
+    }
+}
+
+/// Glob-based redaction configuration for outbound events/messages.
+///
+/// These patterns are applied to any outbound "event payload" surface:
+/// - gateway SSE (`/api/events`)
+/// - gateway WS chat (`/ws/chat`) tool_call/tool_result payloads
+/// - non-CLI channels (Telegram/Slack/Discord/etc.) assistant responses and tool notifications
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChannelEventRedactionConfig {
+    /// Enable internal-path redaction for outbound events.
+    ///
+    /// Note: this is additionally gated by `[security] redact_channel_events`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Sensitive path globs. Any path token matching one of these globs will be
+    /// replaced with `[REDACTED_INTERNAL_PATH]`.
+    ///
+    /// Globs are evaluated against a normalized path string where `\` is
+    /// converted to `/`, and an optional leading `file://` is stripped.
+    #[serde(default = "default_sensitive_redaction_globs")]
+    pub sensitive_globs: Vec<String>,
+
+    /// Additional marker strings that are considered sensitive even if not part
+    /// of a cleanly parsed path token (e.g. exact filenames).
+    #[serde(default = "default_sensitive_redaction_markers")]
+    pub sensitive_markers: Vec<String>,
+}
+
+impl Default for ChannelEventRedactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            sensitive_globs: default_sensitive_redaction_globs(),
+            sensitive_markers: default_sensitive_redaction_markers(),
+        }
+    }
+}
+
+fn default_sensitive_redaction_globs() -> Vec<String> {
+    vec![
+        "**/SOUL.md".to_string(),
+        "**/AGENTS.md".to_string(),
+        "**/USER.md".to_string(),
+        "**/skills/**".to_string(),
+        "**/telegram_files/**".to_string(),
+    ]
+}
+
+fn default_sensitive_redaction_markers() -> Vec<String> {
+    vec!["SOUL.md".to_string(), "AGENTS.md".to_string(), "USER.md".to_string()]
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
