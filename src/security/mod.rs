@@ -74,6 +74,7 @@ pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
+#[allow(unused_imports)]
 pub use channel_event_redaction::{
     redact_internal_paths_in_json, redact_internal_paths_in_json_with_config,
     redact_internal_paths_in_text, redact_internal_paths_in_text_with_config,

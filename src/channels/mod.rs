@@ -380,6 +380,7 @@ struct ChannelCostTrackingState {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
@@ -2638,7 +2639,8 @@ async fn process_channel_message(
                 let _ = channel
                     .send(
                         &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
+                            .in_thread(msg.thread_ts.clone())
+                            .with_reply_to(Some(msg.id.clone())),
                     )
                     .await;
             }
@@ -2662,6 +2664,24 @@ async fn process_channel_message(
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+
+    // Typing indicator for the full prep phase (memory, compression, precheck), not only the LLM call.
+    let is_partial_draft_early = target_channel.as_ref().is_some_and(|ch| {
+        ch.supports_draft_updates() && !ch.supports_multi_message_streaming()
+    });
+    let typing_cancellation_early = if is_partial_draft_early {
+        None
+    } else {
+        target_channel.as_ref().map(|_| CancellationToken::new())
+    };
+    let mut typing_task_early = match (target_channel.as_ref(), typing_cancellation_early.as_ref()) {
+        (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
+            Arc::clone(channel),
+            msg.reply_target.clone(),
+            token.clone(),
+        )),
+        _ => None,
+    };
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
@@ -2861,15 +2881,19 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let reply_intent = if ctx.prompt_config.channels_config.reply_intent_precheck {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -2900,6 +2924,12 @@ async fn process_channel_message(
             started_at.elapsed().as_millis(),
             reason.as_deref().unwrap_or("no reason provided")
         );
+        if let Some(token) = typing_cancellation_early.as_ref() {
+            token.cancel();
+        }
+        if let Some(handle) = typing_task_early.take() {
+            log_worker_join_result(handle.await);
+        }
         return;
     }
 
@@ -2927,7 +2957,9 @@ async fn process_channel_message(
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new("...", &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone())
+                        .with_reply_to(Some(msg.id.clone())),
                 )
                 .await
             {
@@ -3024,25 +3056,6 @@ async fn process_channel_message(
             }
         }
     }
-
-    // Skip typing only for Partial mode — the draft message itself provides
-    // visual feedback. MultiMessage and Off both keep typing active.
-    let is_partial_draft = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
-    let typing_cancellation = if is_partial_draft {
-        None
-    } else {
-        target_channel.as_ref().map(|_| CancellationToken::new())
-    };
-    let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
-        (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
-            Arc::clone(channel),
-            msg.reply_target.clone(),
-            token.clone(),
-        )),
-        _ => None,
-    };
 
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -3236,10 +3249,10 @@ async fn process_channel_message(
     let total_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
 
-    if let Some(token) = typing_cancellation.as_ref() {
+    if let Some(token) = typing_cancellation_early.as_ref() {
         token.cancel();
     }
-    if let Some(handle) = typing_task {
+    if let Some(handle) = typing_task_early {
         log_worker_join_result(handle.await);
     }
 
@@ -3463,7 +3476,8 @@ async fn process_channel_message(
                         let _ = channel
                             .send(
                                 &SendMessage::new(&channel_visible_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .with_reply_to(Some(msg.id.clone())),
                             )
                             .await;
                     }
@@ -3471,6 +3485,7 @@ async fn process_channel_message(
                     .send(
                         &SendMessage::new(&channel_visible_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
+                            .with_reply_to(Some(msg.id.clone()))
                             .with_cancellation(cancellation_token.clone()),
                     )
                     .await
@@ -3542,7 +3557,8 @@ async fn process_channel_message(
                         let _ = channel
                             .send(
                                 &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .with_reply_to(Some(msg.id.clone())),
                             )
                             .await;
                     }
@@ -3588,7 +3604,8 @@ async fn process_channel_message(
                         let _ = channel
                             .send(
                                 &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .with_reply_to(Some(msg.id.clone())),
                             )
                             .await;
                     }
@@ -3636,7 +3653,8 @@ async fn process_channel_message(
                     let _ = channel
                         .send(
                             &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
+                                .in_thread(msg.thread_ts.clone())
+                                .with_reply_to(Some(msg.id.clone())),
                         )
                         .await;
                 }

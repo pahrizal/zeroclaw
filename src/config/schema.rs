@@ -6217,6 +6217,11 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+    /// When `true` (default), run a lightweight LLM call before the main reply to
+    /// classify `REPLY` vs `NO_REPLY` (reply-intent precheck). When `false`, skip
+    /// that call and always run the main agent.
+    #[serde(default = "default_true")]
+    pub reply_intent_precheck: bool,
 }
 
 impl ChannelsConfig {
@@ -6390,6 +6395,7 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            reply_intent_precheck: true,
         }
     }
 }
@@ -11660,6 +11666,7 @@ auto_save = true
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
                 debounce_ms: 0,
+                reply_intent_precheck: true,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -12700,6 +12707,7 @@ allowed_users = ["@ops:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            reply_intent_precheck: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -13074,6 +13082,7 @@ channel_ids = ["C123", "D456"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            reply_intent_precheck: true,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

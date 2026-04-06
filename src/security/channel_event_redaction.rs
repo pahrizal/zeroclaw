@@ -33,7 +33,7 @@ pub fn redact_internal_paths_in_text_with_config(
                 (?P<token>
                     (?:file://)?
                     (?:[A-Za-z]:[\\/]|/)?              # optional drive or unix root
-                    [^\t\r\n \]\)\}\>,"]{1,512}         # path-ish (no whitespace/delims)
+                    [^\t\r\n \]\)\}>,"]{1,512}          # path-ish (no whitespace/delims)
                 )
             "#,
         )

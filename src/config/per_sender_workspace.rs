@@ -3,6 +3,7 @@
 use crate::channels::traits::ChannelMessage;
 
 use anyhow::Result;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Optional platform metadata for per-sender `USER.md` seeding (e.g. Telegram `from`).
@@ -25,20 +26,17 @@ pub fn user_md_seed_content(msg: &ChannelMessage) -> String {
         "This file extends the global `USER.md` in the main workspace. The **Sender snapshot** below was auto-filled when this per-sender workspace was first created.\n\n",
     );
     out.push_str("## Sender snapshot\n\n");
-    out.push_str(&format!("- **Channel:** `{}`\n", msg.channel));
+    let _ = writeln!(out, "- **Channel:** `{}`", msg.channel);
     if let Some(sid) = msg.sender_stable_id.as_deref() {
-        out.push_str(&format!("- **Stable user id:** `{sid}`\n"));
+        let _ = writeln!(out, "- **Stable user id:** `{sid}`");
     }
-    out.push_str(&format!(
-        "- **Display identity (channel):** `{}`\n",
-        msg.sender
-    ));
+    let _ = writeln!(out, "- **Display identity (channel):** `{}`", msg.sender);
     if let Some(p) = &msg.sender_profile {
         if let Some(name) = p.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str(&format!("- **Name:** {name}\n"));
+            let _ = writeln!(out, "- **Name:** {name}");
         }
         if let Some(u) = p.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str(&format!("- **Username:** @{u}\n"));
+            let _ = writeln!(out, "- **Username:** @{u}");
         }
         if let Some(lang) = p
             .language_code
@@ -46,7 +44,7 @@ pub fn user_md_seed_content(msg: &ChannelMessage) -> String {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            out.push_str(&format!("- **Language (client):** `{lang}`\n"));
+            let _ = writeln!(out, "- **Language (client):** `{lang}`");
         }
     }
     out.push_str("\n## Preferences & notes\n\n");

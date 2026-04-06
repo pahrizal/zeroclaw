@@ -19,7 +19,11 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
-const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+/// Emoji reactions used for "ACK" on incoming messages.
+///
+/// Keep this set small and predictable. Some chats restrict which reactions are
+/// allowed; if the chosen emoji isn't allowed, we simply skip reacting.
+const TELEGRAM_ACK_REACTIONS: &[&str] = &["👀"];
 /// TTL for caching Telegram chat available reactions (getChat).
 const TELEGRAM_AVAILABLE_REACTIONS_CACHE_TTL_SECS: u64 = 600;
 
@@ -111,8 +115,9 @@ fn pick_uniform_index(len: usize) -> usize {
     }
 }
 
-fn random_telegram_ack_reaction() -> &'static str {
-    TELEGRAM_ACK_REACTIONS[pick_uniform_index(TELEGRAM_ACK_REACTIONS.len())]
+fn default_telegram_ack_reaction() -> &'static str {
+    // Single fixed default to avoid REACTION_INVALID from random picks.
+    TELEGRAM_ACK_REACTIONS[0]
 }
 
 fn build_telegram_ack_reaction_request(
@@ -196,6 +201,38 @@ fn format_attachment_content(
 
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// Telegram `sendPhoto` is stricter than "image files in general".
+///
+/// In practice, attempting to send unsupported or hard-to-decode formats
+/// (e.g. SVG, some GIFs, mislabeled binaries) often yields
+/// `400 Bad Request: IMAGE_PROCESS_FAILED`.
+///
+/// Keep this list conservative and fall back to `sendDocument` for everything else.
+fn is_telegram_send_photo_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp"))
+        .unwrap_or(false)
+}
+
+fn is_telegram_send_photo_url(target: &str) -> bool {
+    let normalized = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .split('#')
+        .next()
+        .unwrap_or(target);
+
+    let ext = Path::new(normalized)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp")
 }
 
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
@@ -318,6 +355,96 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Parsed `ZEROCLAW_TELEGRAM_ALLOWED_MESSAGE_THREAD_IDS` value.
+#[derive(Debug)]
+struct AllowedTelegramMessageThreads {
+    /// Legacy: bare thread IDs allowed in any chat.
+    global_thread_ids: std::collections::HashSet<i64>,
+    /// Per-chat rules (`<chat_id>.<spec>`).
+    per_chat: std::collections::HashMap<i64, ChatThreadRule>,
+}
+
+impl AllowedTelegramMessageThreads {
+    fn message_allowed(&self, message: &serde_json::Value) -> bool {
+        let Some(chat_id) = message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return false;
+        };
+
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+
+        if !self.global_thread_ids.is_empty() {
+            if let Some(tid) = thread_id {
+                if self.global_thread_ids.contains(&tid) {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(rule) = self.per_chat.get(&chat_id) {
+            return match rule {
+                ChatThreadRule::AllTopics => true,
+                ChatThreadRule::Topics(topics) => {
+                    thread_id.is_some_and(|tid| topics.contains(&tid))
+                }
+            };
+        }
+
+        false
+    }
+}
+
+#[derive(Debug)]
+enum ChatThreadRule {
+    /// e.g. `-100123.*` — all topics in that chat.
+    AllTopics,
+    /// e.g. `-100123.5` or `-100123.[1,2,3]`.
+    Topics(std::collections::HashSet<i64>),
+}
+
+fn merge_chat_thread_rule(into: &mut ChatThreadRule, new: ChatThreadRule) {
+    match new {
+        ChatThreadRule::AllTopics => *into = ChatThreadRule::AllTopics,
+        ChatThreadRule::Topics(b) => match into {
+            ChatThreadRule::AllTopics => {}
+            ChatThreadRule::Topics(a) => {
+                a.extend(b.iter().copied());
+            }
+        },
+    }
+}
+
+/// Split on commas that are not inside `[`…`]`, so lists like `-1.[2,3]` survive.
+fn split_env_list_respecting_brackets(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth: u32 = 0;
+    let mut start = 0;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '[' => depth = depth.saturating_add(1),
+            ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let s = raw[start..i].trim();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let s = raw[start..].trim();
+    if !s.is_empty() {
+        out.push(s);
+    }
+    out
+}
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -329,7 +456,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
-    allowed_message_thread_ids: Option<std::collections::HashSet<i64>>,
+    allowed_message_threads: Option<AllowedTelegramMessageThreads>,
     bot_username: Mutex<Option<String>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
@@ -394,7 +521,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
-            allowed_message_thread_ids: Self::parse_allowed_message_thread_ids_from_env(),
+            allowed_message_threads: Self::parse_allowed_message_threads_from_env(),
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
@@ -412,17 +539,25 @@ impl TelegramChannel {
         }
     }
 
-    fn parse_allowed_message_thread_ids_from_env(
-    ) -> Option<std::collections::HashSet<i64>> {
+    fn parse_allowed_message_threads_from_env() -> Option<AllowedTelegramMessageThreads> {
         const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_ALLOWED_MESSAGE_THREAD_IDS";
         let raw = std::env::var(ENV_KEY).ok()?;
-        let raw = raw.trim();
+        Self::parse_allowed_message_threads_str(ENV_KEY, raw.trim())
+    }
+
+    fn parse_allowed_message_threads_str(
+        label: &str,
+        raw: &str,
+    ) -> Option<AllowedTelegramMessageThreads> {
         if raw.is_empty() || raw == "*" {
             return None;
         }
 
-        let mut out = std::collections::HashSet::new();
-        for part in raw.split(',') {
+        let mut global_thread_ids = std::collections::HashSet::new();
+        let mut per_chat: std::collections::HashMap<i64, ChatThreadRule> =
+            std::collections::HashMap::new();
+
+        for part in split_env_list_respecting_brackets(raw) {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -430,14 +565,81 @@ impl TelegramChannel {
             if part == "*" {
                 return None;
             }
-            if let Ok(id) = part.parse::<i64>() {
-                out.insert(id);
+
+            if let Some(dot_idx) = part.find('.') {
+                let chat_str = part[..dot_idx].trim();
+                let spec = part[dot_idx + 1..].trim();
+                let Ok(chat_id) = chat_str.parse::<i64>() else {
+                    tracing::warn!("{label}: ignoring invalid chat id in entry: {part}");
+                    continue;
+                };
+                let Some(rule) = Self::parse_thread_rule_spec(label, spec) else {
+                    continue;
+                };
+                use std::collections::hash_map::Entry;
+                match per_chat.entry(chat_id) {
+                    Entry::Occupied(mut e) => merge_chat_thread_rule(e.get_mut(), rule),
+                    Entry::Vacant(e) => {
+                        e.insert(rule);
+                    }
+                }
+            } else if let Ok(id) = part.parse::<i64>() {
+                global_thread_ids.insert(id);
             } else {
-                tracing::warn!("{ENV_KEY}: ignoring invalid thread id: {part}");
+                tracing::warn!("{label}: ignoring invalid thread id: {part}");
             }
         }
 
-        (!out.is_empty()).then_some(out)
+        if global_thread_ids.is_empty() && per_chat.is_empty() {
+            return None;
+        }
+
+        Some(AllowedTelegramMessageThreads {
+            global_thread_ids,
+            per_chat,
+        })
+    }
+
+    /// Parses the part after `<chat_id>.` in `ZEROCLAW_TELEGRAM_ALLOWED_MESSAGE_THREAD_IDS`.
+    fn parse_thread_rule_spec(label: &str, spec: &str) -> Option<ChatThreadRule> {
+        let spec = spec.trim();
+        if spec == "*" {
+            return Some(ChatThreadRule::AllTopics);
+        }
+        if spec.starts_with('[') && spec.ends_with(']') {
+            let inner = spec[1..spec.len().saturating_sub(1)].trim();
+            let mut topics = std::collections::HashSet::new();
+            for n in inner.split(',') {
+                let n = n.trim();
+                if n.is_empty() {
+                    continue;
+                }
+                match n.parse::<i64>() {
+                    Ok(v) => {
+                        topics.insert(v);
+                    }
+                    Err(_) => {
+                        tracing::warn!("{label}: ignoring invalid topic id in list: {n}");
+                    }
+                }
+            }
+            if topics.is_empty() {
+                tracing::warn!("{label}: empty topic list in: [{inner}]");
+                return None;
+            }
+            return Some(ChatThreadRule::Topics(topics));
+        }
+        match spec.parse::<i64>() {
+            Ok(v) => {
+                let mut s = std::collections::HashSet::new();
+                s.insert(v);
+                Some(ChatThreadRule::Topics(s))
+            }
+            Err(_) => {
+                tracing::warn!("{label}: ignoring invalid thread spec: {spec}");
+                None
+            }
+        }
     }
 
     fn debug_incoming_enabled() -> bool {
@@ -527,20 +729,10 @@ impl TelegramChannel {
     }
 
     fn is_message_thread_allowed(&self, message: &serde_json::Value) -> bool {
-        let Some(allowed) = self.allowed_message_thread_ids.as_ref() else {
+        let Some(allowed) = self.allowed_message_threads.as_ref() else {
             return true;
         };
-
-        // If filtering is enabled, require a thread id and require it to match.
-        // This makes the filter strict for forum-topic workflows.
-        let Some(thread_id) = message
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64)
-        else {
-            return false;
-        };
-
-        allowed.contains(&thread_id)
+        allowed.message_allowed(message)
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -623,6 +815,29 @@ impl TelegramChannel {
         }
     }
 
+    /// Maps [`SendMessage::reply_to_id`] to Telegram's `reply_to_message_id`.
+    ///
+    /// The agent passes canonical ids (`telegram_{chat_id}_{message_id}`); the Bot API needs the
+    /// numeric `message_id` only. Bare numeric strings are still accepted for compatibility.
+    fn parse_reply_to_message_id_for_api(reply_to_id: &str, expected_chat_id: &str) -> Option<i64> {
+        if let Ok(id) = reply_to_id.parse::<i64>() {
+            return Some(id);
+        }
+        let rest = reply_to_id.strip_prefix("telegram_")?;
+        let (chat_part, mid_str) = rest.rsplit_once('_')?;
+        if chat_part != expected_chat_id {
+            tracing::debug!(
+                target: "zeroclaw::channels::telegram",
+                event = "reply_to_chat_mismatch",
+                reply_to_id,
+                expected_chat_id,
+                "Ignoring reply_to_message_id: id chat does not match send target"
+            );
+            return None;
+        }
+        mid_str.parse().ok()
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
         let message = update.get("message")?;
         let chat_id = message
@@ -659,7 +874,11 @@ impl TelegramChannel {
                 return;
             }
 
-            let emoji = allowed[pick_uniform_index(allowed.len())].clone();
+            let desired = default_telegram_ack_reaction();
+            // Prefer 👀, otherwise skip reacting (no random fallback).
+            let Some(emoji) = allowed.into_iter().find(|e| e == desired) else {
+                return;
+            };
             let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
             let response = match client.post(&set_reaction_url).json(&body).send().await {
@@ -1648,18 +1867,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
 
-        let reply_sender = reply
-            .get("from")
-            .and_then(|from| from.get("username"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                reply
-                    .get("from")
-                    .and_then(|from| from.get("first_name"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .unwrap_or("unknown");
-
         let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
             text.to_string()
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
@@ -2015,6 +2222,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message: &str,
         chat_id: &str,
         thread_id: Option<&str>,
+        reply_to_message_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let chunks = split_message_for_telegram(message);
 
@@ -2040,6 +2248,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+
+            if index == 0 {
+                if let Some(rid) = reply_to_message_id
+                    .and_then(|s| Self::parse_reply_to_message_id_for_api(s, chat_id))
+                {
+                    markdown_body["reply_to_message_id"] = serde_json::json!(rid);
+                }
             }
 
             let markdown_resp = self
@@ -2071,6 +2287,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+
+            if index == 0 {
+                if let Some(rid) = reply_to_message_id
+                    .and_then(|s| Self::parse_reply_to_message_id_for_api(s, chat_id))
+                {
+                    plain_body["reply_to_message_id"] = serde_json::json!(rid);
+                }
             }
             let plain_resp = self
                 .http_client()
@@ -2148,8 +2372,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if is_http_url(target) {
             let result = match attachment.kind {
                 TelegramAttachmentKind::Image => {
-                    self.send_photo_by_url(chat_id, thread_id, target, None)
-                        .await
+                    if is_telegram_send_photo_url(target) {
+                        self.send_photo_by_url(chat_id, thread_id, target, None).await
+                    } else {
+                        tracing::warn!(
+                            url = target,
+                            "Telegram attachment marked as image but URL does not look like a sendPhoto-compatible image; sending as document"
+                        );
+                        self.send_document_by_url(chat_id, thread_id, target, None).await
+                    }
                 }
                 TelegramAttachmentKind::Document => {
                     self.send_document_by_url(chat_id, thread_id, target, None)
@@ -2186,7 +2417,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     TelegramAttachmentKind::Voice => "Voice",
                 };
                 let fallback_text = format!("{kind_label}: {target}");
-                self.send_text_chunks(&fallback_text, chat_id, thread_id)
+                self.send_text_chunks(&fallback_text, chat_id, thread_id, None)
                     .await?;
             }
 
@@ -2214,7 +2445,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         match attachment.kind {
-            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Image => {
+                if is_telegram_send_photo_extension(path) {
+                    self.send_photo(chat_id, thread_id, path, None).await
+                } else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Telegram attachment marked as image but file extension is not sendPhoto-compatible; sending as document"
+                    );
+                    self.send_document(chat_id, thread_id, path, None).await
+                }
+            }
             TelegramAttachmentKind::Document => {
                 self.send_document(chat_id, thread_id, path, None).await
             }
@@ -2748,8 +2989,7 @@ async fn fetch_chat_available_reactions(
     };
 
     match info.available_reactions {
-        None => TelegramAvailableReactions::All,
-        Some(TelegramChatAvailableReactions::All) => TelegramAvailableReactions::All,
+        None | Some(TelegramChatAvailableReactions::All) => TelegramAvailableReactions::All,
         Some(TelegramChatAvailableReactions::Some { reactions }) => {
             let allowed: Vec<String> = reactions
                 .into_iter()
@@ -2795,6 +3035,12 @@ impl Channel for TelegramChannel {
         });
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+
+        if let Some(rid) = message.reply_to_id.as_deref().and_then(|s| {
+            Self::parse_reply_to_message_id_for_api(s, chat_id.as_str())
+        }) {
+            body["reply_to_message_id"] = serde_json::json!(rid);
         }
 
         let resp = self
@@ -2933,7 +3179,7 @@ impl Channel for TelegramChannel {
 
             // Send text without markers
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
+                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref(), None)
                     .await?;
             }
 
@@ -2962,13 +3208,13 @@ impl Channel for TelegramChannel {
 
             // Fall back to chunked send
             return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                 .await;
         }
 
         let Some(id) = msg_id else {
             return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                 .await;
         };
 
@@ -3033,7 +3279,7 @@ impl Channel for TelegramChannel {
 
         match delete_resp {
             Ok(resp) if resp.status().is_success() => {
-                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+                self.send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                     .await
             }
             Ok(resp) => {
@@ -3173,9 +3419,11 @@ impl Channel for TelegramChannel {
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
 
+        let reply_to = message.reply_to_id.as_deref();
+
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, chat_id, thread_id)
+                self.send_text_chunks(&text_without_markers, chat_id, thread_id, reply_to)
                     .await?;
             }
 
@@ -3187,12 +3435,14 @@ impl Channel for TelegramChannel {
         }
 
         if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
-            return Ok(());
+            if self.send_attachment(chat_id, thread_id, &attachment).await.is_ok() {
+                return Ok(());
+            }
+            // Path didn't exist — fall through to send as text
         }
 
-        self.send_text_chunks(&content, chat_id, thread_id).await
+        self.send_text_chunks(&content, chat_id, thread_id, reply_to)
+            .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -3450,17 +3700,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_env_list_respecting_brackets_splits_commas_outside_brackets() {
+        let s = "-1001.*,-1002.[1, 2, 3],42";
+        let p = split_env_list_respecting_brackets(s);
+        assert_eq!(p, vec!["-1001.*", "-1002.[1, 2, 3]", "42"]);
+    }
+
+    #[test]
+    fn parse_reply_to_message_id_accepts_canonical_telegram_id() {
+        assert_eq!(
+            TelegramChannel::parse_reply_to_message_id_for_api(
+                "telegram_-1001131473375_131765",
+                "-1001131473375",
+            ),
+            Some(131_765)
+        );
+    }
+
+    #[test]
+    fn parse_reply_to_message_id_accepts_bare_numeric() {
+        assert_eq!(
+            TelegramChannel::parse_reply_to_message_id_for_api("42", "-100"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_reply_to_message_id_rejects_chat_mismatch() {
+        assert_eq!(
+            TelegramChannel::parse_reply_to_message_id_for_api(
+                "telegram_-100_99",
+                "-999",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_allowed_threads_per_chat_wildcard() {
+        let a = TelegramChannel::parse_allowed_message_threads_str(
+            "test",
+            "-1001131473375.*",
+        )
+        .expect("parsed");
+        assert!(a.global_thread_ids.is_empty());
+        let msg = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 },
+            "message_thread_id": 131_765
+        });
+        assert!(a.message_allowed(&msg));
+        let no_thread = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 }
+        });
+        assert!(a.message_allowed(&no_thread));
+        let other_chat = serde_json::json!({
+            "chat": { "id": -42_i64 },
+            "message_thread_id": 131_765
+        });
+        assert!(!a.message_allowed(&other_chat));
+    }
+
+    #[test]
+    fn parse_allowed_threads_per_chat_bracket_list() {
+        let a = TelegramChannel::parse_allowed_message_threads_str(
+            "test",
+            "-1001131473375.[123,124,135]",
+        )
+        .expect("parsed");
+        let ok = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 },
+            "message_thread_id": 124
+        });
+        assert!(a.message_allowed(&ok));
+        let bad = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 },
+            "message_thread_id": 999
+        });
+        assert!(!a.message_allowed(&bad));
+    }
+
+    #[test]
+    fn parse_allowed_threads_per_chat_single_topic() {
+        let a = TelegramChannel::parse_allowed_message_threads_str(
+            "test",
+            "-1001131473375.131765",
+        )
+        .expect("parsed");
+        let ok = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 },
+            "message_thread_id": 131_765
+        });
+        assert!(a.message_allowed(&ok));
+        let bad = serde_json::json!({
+            "chat": { "id": -1_001_131_473_375_i64 },
+            "message_thread_id": 1
+        });
+        assert!(!a.message_allowed(&bad));
+    }
+
+    #[test]
+    fn parse_allowed_threads_legacy_global_thread_id() {
+        let a = TelegramChannel::parse_allowed_message_threads_str("test", "131765,999")
+            .expect("parsed");
+        assert!(a.per_chat.is_empty());
+        let any_chat = serde_json::json!({
+            "chat": { "id": -50_i64 },
+            "message_thread_id": 131_765
+        });
+        assert!(a.message_allowed(&any_chat));
+    }
+
+    #[test]
+    fn parse_allowed_threads_mixed_global_and_per_chat() {
+        let a = TelegramChannel::parse_allowed_message_threads_str(
+            "test",
+            "999,-200.[1,2]",
+        )
+        .expect("parsed");
+        let global_hit = serde_json::json!({
+            "chat": { "id": -9999_i64 },
+            "message_thread_id": 999
+        });
+        assert!(a.message_allowed(&global_hit));
+        let per_chat_hit = serde_json::json!({
+            "chat": { "id": -200_i64 },
+            "message_thread_id": 2
+        });
+        assert!(a.message_allowed(&per_chat_hit));
+        let miss = serde_json::json!({
+            "chat": { "id": -200_i64 },
+            "message_thread_id": 99
+        });
+        assert!(!a.message_allowed(&miss));
+    }
+
+    #[test]
     fn telegram_channel_name() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         assert_eq!(ch.name(), "telegram");
     }
 
     #[test]
-    fn random_telegram_ack_reaction_is_from_pool() {
-        for _ in 0..128 {
-            let emoji = random_telegram_ack_reaction();
-            assert!(TELEGRAM_ACK_REACTIONS.contains(&emoji));
-        }
+    fn telegram_ack_reaction_defaults_to_eye() {
+        assert_eq!(default_telegram_ack_reaction(), "👀");
     }
 
     #[test]
@@ -4701,7 +5083,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @alice:\n> Hello world");
+        assert_eq!(ctx, "> Reply context:\n> Hello world");
     }
 
     #[test]
@@ -4714,7 +5096,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice message]");
+        assert_eq!(ctx, "> Reply context:\n> [Voice message]");
     }
 
     #[test]
@@ -4736,7 +5118,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @Charlie:\n> Hi there");
+        assert_eq!(ctx, "> Reply context:\n> Hi there");
     }
 
     #[test]
@@ -4755,7 +5137,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
+        assert_eq!(ctx, "> Reply context:\n> [Voice] Hello from voice");
     }
 
     #[test]
@@ -4775,7 +5157,7 @@ mod tests {
         });
         let parsed = ch.parse_update_message(&update).unwrap();
         assert!(
-            parsed.content.starts_with("> @bot:"),
+            parsed.content.starts_with("> Reply context:"),
             "content should start with quote: {}",
             parsed.content
         );

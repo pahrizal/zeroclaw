@@ -663,9 +663,20 @@ mod tests {
     use crate::security::SecurityPolicy;
     use tempfile::TempDir;
 
+    fn tempdir_in_workspace() -> TempDir {
+        // Some sandbox environments only permit child processes to write inside the workspace.
+        // Create git test repos under `zeroclaw/target/` to keep tests reliable.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp-tests");
+        std::fs::create_dir_all(&base).expect("create tmp-tests dir");
+        TempDir::new_in(&base).expect("create tempdir in workspace")
+    }
+
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.to_path_buf(),
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security)
@@ -783,16 +794,10 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_readonly_mode_for_write_ops() {
-        let tmp = TempDir::new().unwrap();
-        // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: ws.to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security);
@@ -814,16 +819,10 @@ mod tests {
 
     #[tokio::test]
     async fn allows_branch_listing_in_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
-        // Initialize a git repository so the command can succeed
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: ws.to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security);
@@ -839,26 +838,17 @@ mod tests {
 
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempdir_in_workspace();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security);
 
-        // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
+        // Read-only operations should be allowed.
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        // The error should be about git (not about autonomy/read-only mode)
-        assert!(!result.success, "Expected failure due to missing git repo");
-        let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.is_empty(),
-            "Expected a git-related error message"
-        );
-        assert!(
-            !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
-            "Error should be about git, not about autonomy restrictions: {error_msg}"
-        );
+        assert!(result.success, "Expected status to succeed in read-only mode");
     }
 
     #[tokio::test]
@@ -879,15 +869,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_operation() {
-        let tmp = TempDir::new().unwrap();
-        // Initialize a git repository
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-
-        let tool = test_tool(tmp.path());
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tool = test_tool(ws);
 
         let result = tool.execute(json!({"operation": "push"})).await.unwrap();
         assert!(!result.success);
@@ -953,29 +936,18 @@ mod tests {
 
     #[tokio::test]
     async fn git_operations_work_in_subdirectory() {
-        let tmp = TempDir::new().unwrap();
-        let sub = tmp.path().join("nested");
-        std::fs::create_dir(&sub).unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&sub)
-            .output()
-            .unwrap();
-
-        let tool = test_tool(tmp.path());
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tmp = TempDir::new_in(ws).unwrap();
+        let sub_name = tmp
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("tempdir has a file name")
+            .to_string();
+        let tool = test_tool(ws);
 
         let result = tool
-            .execute(json!({"operation": "status", "path": "nested"}))
+            .execute(json!({"operation": "status", "path": sub_name}))
             .await
             .unwrap();
         assert!(

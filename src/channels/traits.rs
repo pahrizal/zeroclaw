@@ -37,12 +37,15 @@ pub struct SendMessage {
     pub content: String,
     pub recipient: String,
     pub subject: Option<String>,
+    /// Optional ID of the message to reply to.
+    pub reply_to_id: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
     /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
     pub cancellation_token: Option<CancellationToken>,
     /// File attachments to send with the message.
     /// Channels that don't support attachments ignore this field.
+    /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
@@ -53,6 +56,7 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: None,
+            reply_to_id: None,
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
@@ -69,10 +73,17 @@ impl SendMessage {
             content: content.into(),
             recipient: recipient.into(),
             subject: Some(subject.into()),
+            reply_to_id: None,
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
         }
+    }
+
+    /// Set the message ID to reply to.
+    pub fn with_reply_to(mut self, reply_to_id: Option<String>) -> Self {
+        self.reply_to_id = reply_to_id;
+        self
     }
 
     /// Set the thread identifier for threaded replies.

@@ -79,9 +79,9 @@ mod tests {
                 content: "hello".into(),
                 recipient: "user".into(),
                 subject: None,
+                reply_to_id: None,
                 thread_ts: None,
                 cancellation_token: None,
-                sender_profile: None,
                 attachments: vec![],
             })
             .await;
@@ -96,9 +96,9 @@ mod tests {
                 content: String::new(),
                 recipient: String::new(),
                 subject: None,
+                reply_to_id: None,
                 thread_ts: None,
                 cancellation_token: None,
-                sender_profile: None,
                 attachments: vec![],
             })
             .await;
