@@ -135,7 +135,9 @@ fn build_globset(globs: &[String]) -> GlobSet {
             builder.add(glob);
         }
     }
-    builder.build().unwrap_or_else(|_| GlobSetBuilder::new().build().expect("empty globset"))
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().expect("empty globset"))
 }
 
 fn normalize_token_for_matching(token: &str) -> String {
@@ -152,4 +154,3 @@ fn is_sensitive_token(token: &str, globset: &GlobSet, lowered_markers: &[String]
     let lowered = norm.to_ascii_lowercase();
     lowered_markers.iter().any(|m| lowered.contains(m))
 }
-

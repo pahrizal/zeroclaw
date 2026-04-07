@@ -213,7 +213,12 @@ fn is_http_url(target: &str) -> bool {
 fn is_telegram_send_photo_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp"))
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -646,7 +651,12 @@ impl TelegramChannel {
         const ENV_KEY: &str = "ZEROCLAW_TELEGRAM_DEBUG_INCOMING";
         std::env::var(ENV_KEY)
             .ok()
-            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .map(|v| {
+                matches!(
+                    v.trim(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
             .unwrap_or(false)
     }
 
@@ -684,7 +694,10 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str);
 
         let is_group = Self::is_group_message(message);
-        let has_text = message.get("text").and_then(serde_json::Value::as_str).is_some();
+        let has_text = message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
         let has_caption = message
             .get("caption")
             .and_then(serde_json::Value::as_str)
@@ -856,17 +869,15 @@ impl TelegramChannel {
         let set_reaction_url = self.api_url("setMessageReaction");
         let get_chat_url = self.api_url("getChat");
         let cache = Arc::clone(&self.available_reactions_cache);
-        let ack_set: Vec<String> = TELEGRAM_ACK_REACTIONS.iter().map(|e| (*e).to_string()).collect();
+        let ack_set: Vec<String> = TELEGRAM_ACK_REACTIONS
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect();
 
         tokio::spawn(async move {
-            let allowed = resolve_allowed_ack_reactions(
-                &client,
-                &get_chat_url,
-                &cache,
-                &chat_id,
-                &ack_set,
-            )
-            .await;
+            let allowed =
+                resolve_allowed_ack_reactions(&client, &get_chat_url, &cache, &chat_id, &ack_set)
+                    .await;
             let Some(allowed) = allowed else {
                 return;
             };
@@ -1467,7 +1478,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             if !Self::contains_bot_mention(caption, bot_username) {
-                self.log_incoming_decision(message, "FILTERED", Some("missing_bot_mention_in_caption"));
+                self.log_incoming_decision(
+                    message,
+                    "FILTERED",
+                    Some("missing_bot_mention_in_caption"),
+                );
                 return None;
             }
         }
@@ -1614,9 +1629,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             sender_stable_id: sender_id.clone(),
-            sender_profile: message
-                .get("from")
-                .and_then(Self::telegram_sender_profile),
+            sender_profile: message.get("from").and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -1638,7 +1651,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Voice messages have no text to @mention the bot; keep group behavior strict.
         if self.mention_only && is_group {
-            self.log_incoming_decision(message, "FILTERED", Some("voice_in_group_requires_mention"));
+            self.log_incoming_decision(
+                message,
+                "FILTERED",
+                Some("voice_in_group_requires_mention"),
+            );
             return None;
         }
 
@@ -1764,9 +1781,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             sender_stable_id: sender_id.clone(),
-            sender_profile: message
-                .get("from")
-                .and_then(Self::telegram_sender_profile),
+            sender_profile: message.get("from").and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -2008,9 +2023,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             sender_stable_id: sender_id.clone(),
-            sender_profile: message
-                .get("from")
-                .and_then(Self::telegram_sender_profile),
+            sender_profile: message.get("from").and_then(Self::telegram_sender_profile),
             attachments: vec![],
         })
     }
@@ -2373,13 +2386,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let result = match attachment.kind {
                 TelegramAttachmentKind::Image => {
                     if is_telegram_send_photo_url(target) {
-                        self.send_photo_by_url(chat_id, thread_id, target, None).await
+                        self.send_photo_by_url(chat_id, thread_id, target, None)
+                            .await
                     } else {
                         tracing::warn!(
                             url = target,
                             "Telegram attachment marked as image but URL does not look like a sendPhoto-compatible image; sending as document"
                         );
-                        self.send_document_by_url(chat_id, thread_id, target, None).await
+                        self.send_document_by_url(chat_id, thread_id, target, None)
+                            .await
                     }
                 }
                 TelegramAttachmentKind::Document => {
@@ -2891,13 +2906,17 @@ struct TelegramChatInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TelegramChatAvailableReactions {
     All,
-    Some { reactions: Vec<TelegramReactionType> },
+    Some {
+        reactions: Vec<TelegramReactionType>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TelegramReactionType {
-    Emoji { emoji: String },
+    Emoji {
+        emoji: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -3037,9 +3056,11 @@ impl Channel for TelegramChannel {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
         }
 
-        if let Some(rid) = message.reply_to_id.as_deref().and_then(|s| {
-            Self::parse_reply_to_message_id_for_api(s, chat_id.as_str())
-        }) {
+        if let Some(rid) = message
+            .reply_to_id
+            .as_deref()
+            .and_then(|s| Self::parse_reply_to_message_id_for_api(s, chat_id.as_str()))
+        {
             body["reply_to_message_id"] = serde_json::json!(rid);
         }
 
@@ -3435,7 +3456,11 @@ impl Channel for TelegramChannel {
         }
 
         if let Some(attachment) = parse_path_only_attachment(&content) {
-            if self.send_attachment(chat_id, thread_id, &attachment).await.is_ok() {
+            if self
+                .send_attachment(chat_id, thread_id, &attachment)
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
             // Path didn't exist — fall through to send as text
@@ -3728,21 +3753,15 @@ mod tests {
     #[test]
     fn parse_reply_to_message_id_rejects_chat_mismatch() {
         assert_eq!(
-            TelegramChannel::parse_reply_to_message_id_for_api(
-                "telegram_-100_99",
-                "-999",
-            ),
+            TelegramChannel::parse_reply_to_message_id_for_api("telegram_-100_99", "-999",),
             None
         );
     }
 
     #[test]
     fn parse_allowed_threads_per_chat_wildcard() {
-        let a = TelegramChannel::parse_allowed_message_threads_str(
-            "test",
-            "-1001131473375.*",
-        )
-        .expect("parsed");
+        let a = TelegramChannel::parse_allowed_message_threads_str("test", "-1001131473375.*")
+            .expect("parsed");
         assert!(a.global_thread_ids.is_empty());
         let msg = serde_json::json!({
             "chat": { "id": -1_001_131_473_375_i64 },
@@ -3781,11 +3800,8 @@ mod tests {
 
     #[test]
     fn parse_allowed_threads_per_chat_single_topic() {
-        let a = TelegramChannel::parse_allowed_message_threads_str(
-            "test",
-            "-1001131473375.131765",
-        )
-        .expect("parsed");
+        let a = TelegramChannel::parse_allowed_message_threads_str("test", "-1001131473375.131765")
+            .expect("parsed");
         let ok = serde_json::json!({
             "chat": { "id": -1_001_131_473_375_i64 },
             "message_thread_id": 131_765
@@ -3812,11 +3828,8 @@ mod tests {
 
     #[test]
     fn parse_allowed_threads_mixed_global_and_per_chat() {
-        let a = TelegramChannel::parse_allowed_message_threads_str(
-            "test",
-            "999,-200.[1,2]",
-        )
-        .expect("parsed");
+        let a = TelegramChannel::parse_allowed_message_threads_str("test", "999,-200.[1,2]")
+            .expect("parsed");
         let global_hit = serde_json::json!({
             "chat": { "id": -9999_i64 },
             "message_thread_id": 999

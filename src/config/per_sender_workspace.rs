@@ -32,10 +32,20 @@ pub fn user_md_seed_content(msg: &ChannelMessage) -> String {
     }
     let _ = writeln!(out, "- **Display identity (channel):** `{}`", msg.sender);
     if let Some(p) = &msg.sender_profile {
-        if let Some(name) = p.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(name) = p
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let _ = writeln!(out, "- **Name:** {name}");
         }
-        if let Some(u) = p.username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(u) = p
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let _ = writeln!(out, "- **Username:** @{u}");
         }
         if let Some(lang) = p
@@ -141,11 +151,7 @@ mod tests {
 
     #[test]
     fn per_user_workspace_joins_paths() {
-        let p = per_user_workspace_dir(
-            Path::new("/w"),
-            "per_sender_workspaces",
-            "123",
-        );
+        let p = per_user_workspace_dir(Path::new("/w"), "per_sender_workspaces", "123");
         assert_eq!(p, Some(PathBuf::from("/w/per_sender_workspaces/tg_123")));
     }
 }

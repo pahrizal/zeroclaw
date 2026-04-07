@@ -53,7 +53,11 @@ fn source_does_not_use_legacy_reply_to_field() {
                     .unwrap_or(&file_path)
                     .display()
                     .to_string();
-                let pattern = if has_struct_field { "reply_to:" } else { ".reply_to" };
+                let pattern = if has_struct_field {
+                    "reply_to:"
+                } else {
+                    ".reply_to"
+                };
                 violations.push(format!(
                     "{rel}:{} contains forbidden pattern `{pattern}`: {}",
                     line_idx + 1,

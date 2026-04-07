@@ -2574,8 +2574,7 @@ async fn process_channel_message(
         None
     };
     if let Some(ref p) = per_user_ws {
-        if let Err(e) = crate::config::per_sender_workspace::seed_per_sender_files(p, &msg).await
-        {
+        if let Err(e) = crate::config::per_sender_workspace::seed_per_sender_files(p, &msg).await {
             tracing::warn!(path = %p.display(), "Failed to seed per-sender workspace: {e}");
         }
     }
@@ -2583,7 +2582,10 @@ async fn process_channel_message(
     let memory_for_turn: Arc<dyn Memory> = if ctx.per_sender_isolation {
         if let Some(ref sid) = msg.sender_stable_id {
             if let Some(seg) = crate::config::per_sender_workspace::sanitized_segment(sid) {
-                Arc::new(crate::memory::NamespacedMemory::new(Arc::clone(&ctx.memory), seg))
+                Arc::new(crate::memory::NamespacedMemory::new(
+                    Arc::clone(&ctx.memory),
+                    seg,
+                ))
             } else {
                 Arc::clone(&ctx.memory)
             }
@@ -2666,15 +2668,16 @@ async fn process_channel_message(
     let started_at = Instant::now();
 
     // Typing indicator for the full prep phase (memory, compression, precheck), not only the LLM call.
-    let is_partial_draft_early = target_channel.as_ref().is_some_and(|ch| {
-        ch.supports_draft_updates() && !ch.supports_multi_message_streaming()
-    });
+    let is_partial_draft_early = target_channel
+        .as_ref()
+        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
     let typing_cancellation_early = if is_partial_draft_early {
         None
     } else {
         target_channel.as_ref().map(|_| CancellationToken::new())
     };
-    let mut typing_task_early = match (target_channel.as_ref(), typing_cancellation_early.as_ref()) {
+    let mut typing_task_early = match (target_channel.as_ref(), typing_cancellation_early.as_ref())
+    {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
             msg.reply_target.clone(),
@@ -2848,11 +2851,16 @@ async fn process_channel_message(
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
+    // Telegram speed-first path: avoid extra LLM calls and network round-trips
+    // before the main tool-loop. Telegram already has a higher perceived latency
+    // sensitivity; we prefer faster first-token/first-reply over pre-processing.
+    let is_telegram = msg.channel == "telegram";
+
     // ── Proactive context compression ────────────────────────────
     // Use the existing ContextCompressor to summarize older history
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
-    {
+    if !is_telegram {
         let cc_config = ctx.prompt_config.agent.context_compression.clone();
         let compressor = crate::agent::context_compressor::ContextCompressor::new(
             cc_config,
@@ -2935,7 +2943,7 @@ async fn process_channel_message(
 
     let use_draft_streaming = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+        .is_some_and(|ch| !is_telegram && ch.supports_draft_updates());
 
     tracing::debug!(
         channel = %msg.channel,
@@ -3046,7 +3054,8 @@ async fn process_channel_message(
     };
 
     // React with 👀 to acknowledge the incoming message
-    if ctx.ack_reactions {
+    // Telegram: avoid extra API round-trip on the critical path.
+    if ctx.ack_reactions && !is_telegram {
         if let Some(channel) = target_channel.as_ref() {
             if let Err(e) = channel
                 .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
@@ -3059,8 +3068,8 @@ async fn process_channel_message(
 
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let redact_enabled =
-        ctx.prompt_config.security.redact_channel_events && ctx.prompt_config.security.channel_event_redaction.enabled;
+    let redact_enabled = ctx.prompt_config.security.redact_channel_events
+        && ctx.prompt_config.security.channel_event_redaction.enabled;
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
@@ -3121,105 +3130,104 @@ async fn process_channel_message(
             None
         };
         crate::security::channel_workspace::CHANNEL_WORKSPACE_OVERRIDE
-            .scope(
-                ws_override,
-                async {
-                    let llm_result = loop {
-                        let loop_result = tokio::select! {
-                () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = tokio::time::timeout(
-                    Duration::from_secs(timeout_budget_secs),
-                    scope_thread_id(
-                        msg.interruption_scope_id.clone()
-                            .or_else(|| msg.thread_ts.clone())
-                            .or_else(|| Some(msg.id.clone())),
-                        crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                            cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                        active_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                    ),
-                    ),
-                    ),
-                ) => LlmExecutionResult::Completed(result),
-            };
+            .scope(ws_override, async {
+                let llm_result = loop {
+                    let loop_result = tokio::select! {
+                        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+                        result = tokio::time::timeout(
+                            Duration::from_secs(timeout_budget_secs),
+                            scope_thread_id(
+                                msg.interruption_scope_id.clone()
+                                    .or_else(|| msg.thread_ts.clone())
+                                    .or_else(|| Some(msg.id.clone())),
+                                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                    cost_tracking_context.clone(),
+                                run_tool_call_loop(
+                                active_provider.as_ref(),
+                                &mut history,
+                                ctx.tools_registry.as_ref(),
+                                notify_observer.as_ref() as &dyn Observer,
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                Some(&*ctx.approval_manager),
+                                msg.channel.as_str(),
+                                Some(msg.reply_target.as_str()),
+                                &ctx.multimodal,
+                                ctx.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx.clone(),
+                                ctx.hooks.as_deref(),
+                                if msg.channel == "cli"
+                                    || ctx.autonomy_level == AutonomyLevel::Full
+                                {
+                                    &[]
+                                } else {
+                                    ctx.non_cli_excluded_tools.as_ref()
+                                },
+                                ctx.tool_call_dedup_exempt.as_ref(),
+                                ctx.activated_tools.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &ctx.pacing,
+                                ctx.max_tool_result_chars,
+                                ctx.context_token_budget,
+                                None, // shared_budget
+                            ),
+                            ),
+                            ),
+                        ) => LlmExecutionResult::Completed(result),
+                    };
 
-            // Handle model switch: re-create the provider and retry
-            if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
-                if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
-                    tracing::info!(
-                        "Model switch requested, switching from {} {} to {} {}",
-                        route.provider,
-                        route.model,
-                        new_provider,
-                        new_model
-                    );
+                    // Handle model switch: re-create the provider and retry
+                    if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
+                        if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
+                            tracing::info!(
+                                "Model switch requested, switching from {} {} to {} {}",
+                                route.provider,
+                                route.model,
+                                new_provider,
+                                new_model
+                            );
 
-                    match create_resilient_provider_nonblocking(
-                        &new_provider,
-                        ctx.api_key.clone(),
-                        ctx.api_url.clone(),
-                        ctx.reliability.as_ref().clone(),
-                        ctx.provider_runtime_options.clone(),
-                    )
-                    .await
-                    {
-                        Ok(new_prov) => {
-                            active_provider = Arc::from(new_prov);
-                            route.provider = new_provider;
-                            route.model = new_model;
-                            clear_model_switch_request();
+                            match create_resilient_provider_nonblocking(
+                                &new_provider,
+                                ctx.api_key.clone(),
+                                ctx.api_url.clone(),
+                                ctx.reliability.as_ref().clone(),
+                                ctx.provider_runtime_options.clone(),
+                            )
+                            .await
+                            {
+                                Ok(new_prov) => {
+                                    active_provider = Arc::from(new_prov);
+                                    route.provider = new_provider;
+                                    route.model = new_model;
+                                    clear_model_switch_request();
 
-                            ctx.observer.record_event(&ObserverEvent::AgentStart {
-                                provider: route.provider.clone(),
-                                model: route.model.clone(),
-                            });
+                                    ctx.observer.record_event(&ObserverEvent::AgentStart {
+                                        provider: route.provider.clone(),
+                                        model: route.model.clone(),
+                                    });
 
-                            continue;
-                        }
-                        Err(err) => {
-                            tracing::error!("Failed to create provider after model switch: {err}");
-                            clear_model_switch_request();
-                            // Fall through with the original error
+                                    continue;
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        "Failed to create provider after model switch: {err}"
+                                    );
+                                    clear_model_switch_request();
+                                    // Fall through with the original error
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            break loop_result;
-        };
-                    let fb = take_last_provider_fallback();
-                    (llm_result, fb)
-                },
-            )
+                    break loop_result;
+                };
+                let fb = take_last_provider_fallback();
+                (llm_result, fb)
+            })
             .await
     })
     .await;
@@ -4251,12 +4259,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        apply_openclaw_bootstrap_bundle(
-            &mut prompt,
-            workspace_dir,
-            max_chars,
-            bootstrap_injection,
-        );
+        apply_openclaw_bootstrap_bundle(&mut prompt, workspace_dir, max_chars, bootstrap_injection);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -4362,10 +4365,7 @@ fn inject_workspace_file_titled(
             }
         }
         Err(_) => {
-            let _ = writeln!(
-                prompt,
-                "### {heading}\n\n[File not found: {filename}]\n"
-            );
+            let _ = writeln!(prompt, "### {heading}\n\n[File not found: {filename}]\n");
         }
     }
 }
@@ -5682,23 +5682,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let bootstrap_injection =
-        if config.workspace.per_sender_isolation && !crate::identity::is_aieos_configured(&config.identity)
+    let bootstrap_injection = if config.workspace.per_sender_isolation
+        && !crate::identity::is_aieos_configured(&config.identity)
+    {
+        tracing::info!(
+            "Per-sender workspace isolation: using IdentityOnly bootstrap in cached system prompt"
+        );
+        crate::config::WorkspaceBootstrapInjection::IdentityOnly
+    } else {
+        if config.workspace.per_sender_isolation
+            && crate::identity::is_aieos_configured(&config.identity)
         {
-            tracing::info!(
-                "Per-sender workspace isolation: using IdentityOnly bootstrap in cached system prompt"
+            tracing::warn!(
+                "per_sender_isolation is set but AIEOS identity is configured; using Full bootstrap (per-sender USER/MEMORY still applies when sender_stable_id is present)"
             );
-            crate::config::WorkspaceBootstrapInjection::IdentityOnly
-        } else {
-            if config.workspace.per_sender_isolation
-                && crate::identity::is_aieos_configured(&config.identity)
-            {
-                tracing::warn!(
-                    "per_sender_isolation is set but AIEOS identity is configured; using Full bootstrap (per-sender USER/MEMORY still applies when sender_stable_id is present)"
-                );
-            }
-            crate::config::WorkspaceBootstrapInjection::Full
-        };
+        }
+        crate::config::WorkspaceBootstrapInjection::Full
+    };
     let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,

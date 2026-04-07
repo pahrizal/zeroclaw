@@ -464,12 +464,16 @@ async fn process_chat_message(
             let (redact_enabled, redaction_cfg) = {
                 let cfg = state.config.lock();
                 (
-                    cfg.security.redact_channel_events && cfg.security.channel_event_redaction.enabled,
+                    cfg.security.redact_channel_events
+                        && cfg.security.channel_event_redaction.enabled,
                     cfg.security.channel_event_redaction.clone(),
                 )
             };
             if redact_enabled {
-                crate::security::redact_internal_paths_in_json_with_config(&mut ws_msg, &redaction_cfg);
+                crate::security::redact_internal_paths_in_json_with_config(
+                    &mut ws_msg,
+                    &redaction_cfg,
+                );
             }
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }

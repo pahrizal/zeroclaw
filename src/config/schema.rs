@@ -7379,7 +7379,11 @@ fn default_sensitive_redaction_globs() -> Vec<String> {
 }
 
 fn default_sensitive_redaction_markers() -> Vec<String> {
-    vec!["SOUL.md".to_string(), "AGENTS.md".to_string(), "USER.md".to_string()]
+    vec![
+        "SOUL.md".to_string(),
+        "AGENTS.md".to_string(),
+        "USER.md".to_string(),
+    ]
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).

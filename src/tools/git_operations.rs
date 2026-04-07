@@ -848,7 +848,10 @@ mod tests {
 
         // Read-only operations should be allowed.
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        assert!(result.success, "Expected status to succeed in read-only mode");
+        assert!(
+            result.success,
+            "Expected status to succeed in read-only mode"
+        );
     }
 
     #[tokio::test]

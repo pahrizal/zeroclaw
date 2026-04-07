@@ -19,13 +19,14 @@
 //! change guidelines.
 
 pub mod audit;
-pub mod channel_workspace;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod channel_workspace;
 pub mod detect;
 pub mod docker;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
+pub mod channel_event_redaction;
 pub mod domain_matcher;
 pub mod estop;
 #[cfg(target_os = "linux")]
@@ -39,7 +40,6 @@ pub mod otp;
 pub mod pairing;
 pub mod playbook;
 pub mod policy;
-pub mod channel_event_redaction;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
@@ -73,12 +73,12 @@ pub use iam_policy::{IamPolicy, PolicyDecision};
 pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
-pub use leak_detector::{LeakDetector, LeakResult};
-#[allow(unused_imports)]
 pub use channel_event_redaction::{
     redact_internal_paths_in_json, redact_internal_paths_in_json_with_config,
     redact_internal_paths_in_text, redact_internal_paths_in_text_with_config,
 };
+#[allow(unused_imports)]
+pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 #[allow(unused_imports)]
