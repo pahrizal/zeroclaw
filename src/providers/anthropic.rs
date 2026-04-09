@@ -222,9 +222,7 @@ impl AnthropicProvider {
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            request
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("x-api-key", credential)
+            request.header("x-api-key", credential)
         }
     }
 

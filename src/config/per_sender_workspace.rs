@@ -191,9 +191,6 @@ mod tests {
     fn per_user_workspace_rejects_unsafe_segment() {
         assert_eq!(per_user_workspace_dir(Path::new("/w"), "sub", ""), None);
         assert_eq!(per_user_workspace_dir(Path::new("/w"), "sub", ".."), None);
-        assert_eq!(
-            per_user_workspace_dir(Path::new("/w"), "sub", "a/b"),
-            None
-        );
+        assert_eq!(per_user_workspace_dir(Path::new("/w"), "sub", "a/b"), None);
     }
 }

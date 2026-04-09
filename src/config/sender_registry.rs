@@ -29,12 +29,8 @@ fn with_connection<T>(
         std::fs::create_dir_all(parent)?;
     }
 
-    let conn = Connection::open(&path).with_context(|| {
-        format!(
-            "Failed to open sender registry DB at {}",
-            path.display()
-        )
-    })?;
+    let conn = Connection::open(&path)
+        .with_context(|| format!("Failed to open sender registry DB at {}", path.display()))?;
 
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -143,10 +139,7 @@ pub fn lookup_stable_id(
 /// 3. Update the memory namespace in `brain.db` (best-effort).
 ///
 /// Returns the count of migrated folders.
-pub fn migrate_legacy_folders(
-    workspace_dir: &Path,
-    per_sender_subdir: &str,
-) -> Result<usize> {
+pub fn migrate_legacy_folders(workspace_dir: &Path, per_sender_subdir: &str) -> Result<usize> {
     let base_dir = workspace_dir.join(per_sender_subdir.trim_matches('/'));
     if !base_dir.exists() {
         return Ok(0);

@@ -6201,6 +6201,17 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Allowlist of operator identities permitted to run runtime commands that
+    /// mutate state (e.g. `/model <...>`, `/models <...>`, `/new`, `/config`).
+    ///
+    /// When empty, these mutating runtime commands are disabled (deny-by-default).
+    ///
+    /// Entries may match:
+    /// - `sender_stable_id` (when present)
+    /// - `channel:sender` (e.g. `telegram:555`, `slack:U012ABCDEF`)
+    /// - raw `sender`
+    #[serde(default)]
+    pub runtime_command_operators: Vec<String>,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -6391,6 +6402,7 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
+            runtime_command_operators: Vec::new(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -11666,6 +11678,7 @@ auto_save = true
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
+                runtime_command_operators: vec![],
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
@@ -12707,6 +12720,7 @@ allowed_users = ["@ops:matrix.org"]
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            runtime_command_operators: vec![],
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -13082,6 +13096,7 @@ channel_ids = ["C123", "D456"]
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
+            runtime_command_operators: vec![],
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,

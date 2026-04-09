@@ -798,6 +798,49 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
 }
 
+fn env_true(var_name: &str) -> bool {
+    std::env::var(var_name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_runtime_operator(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) -> bool {
+    let allowed = &ctx.prompt_config.channels_config.runtime_command_operators;
+    if allowed.is_empty() {
+        return false;
+    }
+
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    if let Some(ref stable) = msg.sender_stable_id {
+        if !stable.trim().is_empty() {
+            candidates.push(stable.clone());
+        }
+    }
+    candidates.push(format!("{}:{}", msg.channel, msg.sender));
+    candidates.push(msg.sender.clone());
+
+    allowed.iter().any(|entry| {
+        let e = entry.trim();
+        !e.is_empty() && candidates.iter().any(|c| c.trim().eq_ignore_ascii_case(e))
+    })
+}
+
+fn runtime_command_requires_operator(cmd: &ChannelRuntimeCommand) -> bool {
+    matches!(
+        cmd,
+        ChannelRuntimeCommand::SetProvider(_)
+            | ChannelRuntimeCommand::SetModel(_)
+            | ChannelRuntimeCommand::ShowConfig
+            | ChannelRuntimeCommand::NewSession
+    )
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
@@ -1800,6 +1843,21 @@ async fn handle_runtime_command_if_needed(
     let sender_key = conversation_history_key(msg);
     let mut current = get_route_selection(ctx, &sender_key);
 
+    if runtime_command_requires_operator(&command) && !is_runtime_operator(ctx, msg) {
+        let response = "Not authorized to run this command.\n\nAsk an operator to allowlist your sender ID under `channels_config.runtime_command_operators`."
+            .to_string();
+        if let Err(err) = channel
+            .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await
+        {
+            tracing::warn!(
+                "Failed to send runtime command response on {}: {err}",
+                channel.name()
+            );
+        }
+        return true;
+    }
+
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
@@ -1834,26 +1892,38 @@ async fn handle_runtime_command_if_needed(
             build_models_help_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
-            let model = raw_model.trim().trim_matches('`').to_string();
-            if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
-            } else {
-                // Resolve provider+model from model_routes (match by model name or hint)
-                if let Some(route) = ctx.model_routes.iter().find(|r| {
-                    r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
-                }) {
-                    current.provider = route.provider.clone();
-                    current.model = route.model.clone();
-                    current.api_key = route.api_key.clone();
-                } else {
-                    current.model = model.clone();
-                }
-                set_route_selection(ctx, &sender_key, current.clone());
+            let env_model_is_set = std::env::var("ZEROCLAW_MODEL")
+                .or_else(|_| std::env::var("MODEL"))
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let allow_runtime_switch_when_env_set = env_true("ZEROCLAW_ALLOW_RUNTIME_MODEL_SWITCH");
 
-                format!(
-                    "Model switched to `{}` (provider: `{}`). Context preserved.",
-                    current.model, current.provider
-                )
+            if env_model_is_set && !allow_runtime_switch_when_env_set {
+                "Runtime model switching is locked because `ZEROCLAW_MODEL` (or `MODEL`) is set in the environment.\n\nUpdate your `.env`/env vars, or set `ZEROCLAW_ALLOW_RUNTIME_MODEL_SWITCH=1` (operators only) to enable `/model <...>` switching."
+                    .to_string()
+            } else {
+                let model = raw_model.trim().trim_matches('`').to_string();
+                if model.is_empty() {
+                    "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                } else {
+                    // Resolve provider+model from model_routes (match by model name or hint)
+                    if let Some(route) = ctx.model_routes.iter().find(|r| {
+                        r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
+                    }) {
+                        current.provider = route.provider.clone();
+                        current.model = route.model.clone();
+                        current.api_key = route.api_key.clone();
+                    } else {
+                        current.model = model.clone();
+                    }
+                    set_route_selection(ctx, &sender_key, current.clone());
+
+                    format!(
+                        "Model switched to `{}` (provider: `{}`). Context preserved.",
+                        current.model, current.provider
+                    )
+                }
             }
         }
         ChannelRuntimeCommand::ShowConfig => {
@@ -2562,33 +2632,33 @@ async fn process_channel_message(
 
     let history_key = conversation_history_key(&msg);
 
-    let (per_user_ws, sender_uuid): (Option<PathBuf>, Option<String>) =
-        if ctx.per_sender_isolation {
-            if let Some(ref sid) = msg.sender_stable_id {
-                match crate::config::sender_registry::get_or_create_uuid(
-                    ctx.workspace_dir.as_ref(),
-                    &ctx.per_sender_subdir,
-                    sid,
-                ) {
-                    Ok((uuid, _created)) => {
-                        let path = crate::config::per_sender_workspace::per_user_workspace_dir(
-                            ctx.workspace_dir.as_ref(),
-                            &ctx.per_sender_subdir,
-                            &uuid,
-                        );
-                        (path, Some(uuid))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to resolve sender UUID: {e}");
-                        (None, None)
-                    }
+    let (per_user_ws, sender_uuid): (Option<PathBuf>, Option<String>) = if ctx.per_sender_isolation
+    {
+        if let Some(ref sid) = msg.sender_stable_id {
+            match crate::config::sender_registry::get_or_create_uuid(
+                ctx.workspace_dir.as_ref(),
+                &ctx.per_sender_subdir,
+                sid,
+            ) {
+                Ok((uuid, _created)) => {
+                    let path = crate::config::per_sender_workspace::per_user_workspace_dir(
+                        ctx.workspace_dir.as_ref(),
+                        &ctx.per_sender_subdir,
+                        &uuid,
+                    );
+                    (path, Some(uuid))
                 }
-            } else {
-                (None, None)
+                Err(e) => {
+                    tracing::warn!("Failed to resolve sender UUID: {e}");
+                    (None, None)
+                }
             }
         } else {
             (None, None)
-        };
+        }
+    } else {
+        (None, None)
+    };
     if let Some(ref p) = per_user_ws {
         if let Err(e) = crate::config::per_sender_workspace::seed_per_sender_files(p, &msg).await {
             tracing::warn!(path = %p.display(), "Failed to seed per-sender workspace: {e}");
@@ -7684,6 +7754,10 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
 
+        let mut prompt_config = crate::config::Config::default();
+        prompt_config.channels_config.runtime_command_operators =
+            vec!["telegram:alice".to_string(), "alice".to_string()];
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
@@ -7711,7 +7785,7 @@ BTC is currently around $65,000 based on latest tool output."#
             per_sender_isolation: false,
             per_sender_identity_only_bootstrap: false,
             per_sender_subdir: "per_sender_workspaces".to_string(),
-            prompt_config: Arc::new(crate::config::Config::default()),
+            prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7779,6 +7853,107 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_denies_models_command_with_provider_arg_when_not_operator() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+
+        // Empty operator allowlist => deny-by-default
+        let prompt_config = crate::config::Config::default();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            per_sender_isolation: false,
+            per_sender_identity_only_bootstrap: false,
+            per_sender_subdir: "per_sender_workspaces".to_string(),
+            prompt_config: Arc::new(prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-cmd-deny-1".to_string(),
+                sender: "mallory".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/models openrouter".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                sender_stable_id: None,
+                sender_profile: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Not authorized"));
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -10091,6 +10266,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         config.skills.open_skills_enabled = false;
+        config.channels_config.runtime_command_operators =
+            vec!["telegram:alice".to_string(), "alice".to_string()];
 
         let initial_skills = crate::skills::load_skills_with_config(workspace.path(), &config);
         assert!(initial_skills.is_empty());
