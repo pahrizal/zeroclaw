@@ -1544,10 +1544,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender_id
                 .as_ref()
                 .and_then(|sid| {
-                    crate::config::per_sender_workspace::per_user_workspace_dir(
+                    crate::config::sender_registry::lookup_uuid(
                         global,
                         &self.per_sender_subdir,
                         sid,
+                    )
+                    .ok()
+                    .flatten()
+                })
+                .and_then(|uuid| {
+                    crate::config::per_sender_workspace::per_user_workspace_dir(
+                        global,
+                        &self.per_sender_subdir,
+                        &uuid,
                     )
                 })
                 .unwrap_or_else(|| global.clone())

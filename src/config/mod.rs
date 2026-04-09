@@ -1,5 +1,6 @@
 pub mod per_sender_workspace;
 pub mod schema;
+pub mod sender_registry;
 pub mod traits;
 pub mod workspace;
 

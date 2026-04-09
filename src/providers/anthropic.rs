@@ -222,7 +222,9 @@ impl AnthropicProvider {
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            request.header("x-api-key", credential)
+            request
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("x-api-key", credential)
         }
     }
 
@@ -1038,7 +1040,9 @@ impl Provider for AnthropicProvider {
                     )
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
-                req = req.header("x-api-key", &credential);
+                req = req
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("x-api-key", &credential);
             }
 
             let response = match req.send().await {

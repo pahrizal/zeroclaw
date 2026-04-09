@@ -2562,17 +2562,33 @@ async fn process_channel_message(
 
     let history_key = conversation_history_key(&msg);
 
-    let per_user_ws = if ctx.per_sender_isolation {
-        msg.sender_stable_id.as_deref().and_then(|sid| {
-            crate::config::per_sender_workspace::per_user_workspace_dir(
-                ctx.workspace_dir.as_ref(),
-                &ctx.per_sender_subdir,
-                sid,
-            )
-        })
-    } else {
-        None
-    };
+    let (per_user_ws, sender_uuid): (Option<PathBuf>, Option<String>) =
+        if ctx.per_sender_isolation {
+            if let Some(ref sid) = msg.sender_stable_id {
+                match crate::config::sender_registry::get_or_create_uuid(
+                    ctx.workspace_dir.as_ref(),
+                    &ctx.per_sender_subdir,
+                    sid,
+                ) {
+                    Ok((uuid, _created)) => {
+                        let path = crate::config::per_sender_workspace::per_user_workspace_dir(
+                            ctx.workspace_dir.as_ref(),
+                            &ctx.per_sender_subdir,
+                            &uuid,
+                        );
+                        (path, Some(uuid))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to resolve sender UUID: {e}");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
     if let Some(ref p) = per_user_ws {
         if let Err(e) = crate::config::per_sender_workspace::seed_per_sender_files(p, &msg).await {
             tracing::warn!(path = %p.display(), "Failed to seed per-sender workspace: {e}");
@@ -2580,15 +2596,11 @@ async fn process_channel_message(
     }
 
     let memory_for_turn: Arc<dyn Memory> = if ctx.per_sender_isolation {
-        if let Some(ref sid) = msg.sender_stable_id {
-            if let Some(seg) = crate::config::per_sender_workspace::sanitized_segment(sid) {
-                Arc::new(crate::memory::NamespacedMemory::new(
-                    Arc::clone(&ctx.memory),
-                    seg,
-                ))
-            } else {
-                Arc::clone(&ctx.memory)
-            }
+        if let Some(ref uuid) = sender_uuid {
+            Arc::new(crate::memory::NamespacedMemory::new(
+                Arc::clone(&ctx.memory),
+                uuid.clone(),
+            ))
         } else {
             Arc::clone(&ctx.memory)
         }
@@ -5780,6 +5792,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "  👤 Per-sender isolation: on (subdir: {})",
             config.workspace.per_sender_subdir
         );
+        // Migrate legacy tg_<id> folders to UUID-based names
+        match crate::config::sender_registry::migrate_legacy_folders(
+            &config.workspace_dir,
+            &config.workspace.per_sender_subdir,
+        ) {
+            Ok(0) => { /* nothing to migrate */ }
+            Ok(n) => println!("  📦 Migrated {n} legacy per-sender folder(s) to UUID"),
+            Err(e) => tracing::warn!("Failed to migrate legacy per-sender folders: {e}"),
+        }
     }
     println!();
     println!("  Listening for messages... (Ctrl+C to stop)");
